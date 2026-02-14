@@ -1,0 +1,79 @@
+// hello.laz - Laz demonstration program
+// Struct definition
+struct Point {
+    x: float,
+    y: float,
+}
+
+// Function with struct parameter
+fn distance(p1: Point, p2: Point) -> float {
+    let dx: float = p2.x - p1.x;
+    let dy: float = p2.y - p1.y;
+    return (dx * dx + dy * dy);
+}
+
+// Recursive function
+fn factorial(n: int) -> int {
+    if n <= 1 {
+        return 1;
+    }
+    return n * factorial(n - 1);
+}
+
+// Loops demonstration
+fn fizzbuzz(limit: int) -> void {
+    for i in 1..limit {
+        if i % 15 == 0 {
+            print("FizzBuzz");
+        } else if i % 3 == 0 {
+            print("Fizz");
+        } else if i % 5 == 0 {
+            print("Buzz");
+        } else {
+            print(i);
+        }
+    }
+}
+
+// While loop with mutation
+fn countdown(start: int) -> void {
+    let mut n: int = start;
+    while n > 0 {
+        print(n);
+        n = n - 1;
+    }
+    print("Liftoff!");
+}
+
+// String and bool
+fn greet(name: string, formal: bool) -> string {
+    if formal {
+        return "Good day, " + name + ".";
+    }
+    return "Hey, " + name + "!";
+}
+
+// Entry point
+fn main() -> void {
+    let x: int = 42;
+    let pi: float = 3.14159;
+    let greeting: string = "Hello, Laz!";
+    let is_awesome: bool = true;
+    // Esto es un comentario
+    print(greeting);
+    print("x =", x);
+    print("pi =", pi);
+    print("is_awesome =", is_awesome);
+    let fact5: int = factorial(5);
+    print("5! =", fact5);
+    let origin: Point = Point { x: 0.0, y: 0.0 };
+    let target: Point = Point { x: 3.0, y: 4.0 };
+    let dist: float = distance(origin, target);
+    print("Distance:", dist);
+    let msg: string = greet("World", false);
+    print(msg);
+    print("--- FizzBuzz ---");
+    fizzbuzz(16);
+    print("--- Countdown ---");
+    countdown(5);
+}

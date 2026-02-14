@@ -1,0 +1,56 @@
+// sql_demo.lz - Demonstration of SQL queries on CSV files
+
+// Forma 1: connect json con alias
+connect file "users.csv" as users;
+connect file "users copy.csv" as users_copy;
+
+// Struct que representa una fila del CSV
+struct User {
+    name: string,
+    age: int,
+    city: string,
+}
+
+fn main() -> void {
+    // ===== Usando alias (connect csv) =====
+    print("=== Forma 1: connect csv alias ===");
+
+    // SELECT con list<User> tipado
+    print("--- All users ---");
+    let all_users : list<User> = #SELECT * FROM users;
+    print(all_users);
+
+    // SELECT con WHERE
+    print("--- Users from Madrid ---");
+    let madrid: list<User> = #SELECT name, age FROM users WHERE city == "Madrid";
+    print(madrid);
+
+    // SELECT SINGLE
+    print("--- Find Bob ---");
+    let bob: User = #SELECT SINGLE * FROM users WHERE name == "Bob";
+    print(bob);
+    print("Bob's age:", bob.age);
+    print("Bob's city:", bob.city);
+
+    // ===== Usando file() inline =====
+    print("=== Forma 2: file() inline ===");
+
+    // SELECT directo con ruta al CSV
+    let all_inline: list<User> = #SELECT * FROM file("users.csv");
+    print(all_inline);
+
+    // SELECT con WHERE usando file() inline
+    print("--- Older than 27 (inline) ---");
+    let older: list<User> = #SELECT name, age FROM file("users.csv") WHERE age > 27;
+    print(older);
+
+    // INSERT usando alias
+    print("--- Inserting new user ---");
+    let success: bool = #INSERT INTO users_copy VALUES ("Frank", 40, "Bilbao");
+    print("Insert success:", success);
+
+    // Verificar insert con file() inline
+    print("--- After insert (inline) ---");
+    let updated: list<User> = #SELECT * FROM file("users copy.csv");
+    print(updated);
+}
