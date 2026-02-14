@@ -2,27 +2,52 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
-#[derive(Debug, Clone)]
-pub struct CsvTable {
-    pub headers: Vec<String>,
-    pub rows: Vec<Vec<String>>,
+#[derive(Debug, Clone, PartialEq)]
+pub enum DataFormat {
+    Csv,
+    Json,
 }
 
-impl CsvTable {
-    pub fn from_file(path: &Path) -> Result<CsvTable, String> {
+impl DataFormat {
+    pub fn from_extension(path: &Path) -> Result<DataFormat, String> {
+        match path.extension().and_then(|e| e.to_str()) {
+            Some("csv") => Ok(DataFormat::Csv),
+            Some("json") => Ok(DataFormat::Json),
+            Some(ext) => Err(format!("unsupported file format: .{}", ext)),
+            None => Err("file has no extension".to_string()),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct DataTable {
+    pub headers: Vec<String>,
+    pub rows: Vec<Vec<String>>,
+    pub format: DataFormat,
+}
+
+impl DataTable {
+    /// Load a data file, detecting format by extension
+    pub fn from_file(path: &Path) -> Result<DataTable, String> {
+        let format = DataFormat::from_extension(path)?;
         let content = fs::read_to_string(path)
-            .map_err(|e| format!("cannot read CSV file '{}': {}", path.display(), e))?;
-        Self::parse(&content)
+            .map_err(|e| format!("cannot read file '{}': {}", path.display(), e))?;
+
+        match format {
+            DataFormat::Csv => Self::parse_csv(&content),
+            DataFormat::Json => Err("JSON support not yet implemented".to_string()),
+        }
     }
 
-    pub fn parse(content: &str) -> Result<CsvTable, String> {
+    /// Parse CSV content into a DataTable
+    pub fn parse_csv(content: &str) -> Result<DataTable, String> {
         let mut lines = content.lines();
 
-        let header_line = lines.next().ok_or("CSV file is empty")?;
+        let header_line = lines.next().ok_or("file is empty")?;
         let headers: Vec<String> = parse_csv_line(header_line);
 
         if headers.is_empty() {
-            return Err("CSV file has no columns".to_string());
+            return Err("file has no columns".to_string());
         }
 
         let mut rows = Vec::new();
@@ -34,14 +59,14 @@ impl CsvTable {
             let fields = parse_csv_line(trimmed);
             if fields.len() != headers.len() {
                 return Err(format!(
-                    "CSV row has {} fields, expected {} (headers: {:?})",
+                    "row has {} fields, expected {} (headers: {:?})",
                     fields.len(), headers.len(), headers
                 ));
             }
             rows.push(fields);
         }
 
-        Ok(CsvTable { headers, rows })
+        Ok(DataTable { headers, rows, format: DataFormat::Csv })
     }
 
     pub fn column_index(&self, name: &str) -> Option<usize> {
@@ -69,7 +94,15 @@ impl CsvTable {
         Ok(())
     }
 
+    /// Save to file, using the format detected at load time
     pub fn save_to_file(&self, path: &Path) -> Result<(), String> {
+        match self.format {
+            DataFormat::Csv => self.save_as_csv(path),
+            DataFormat::Json => Err("JSON write not yet implemented".to_string()),
+        }
+    }
+
+    fn save_as_csv(&self, path: &Path) -> Result<(), String> {
         let mut content = String::new();
         content.push_str(&self.headers.join(","));
         content.push('\n');
@@ -79,7 +112,7 @@ impl CsvTable {
             content.push('\n');
         }
         fs::write(path, &content)
-            .map_err(|e| format!("cannot write CSV file '{}': {}", path.display(), e))
+            .map_err(|e| format!("cannot write file '{}': {}", path.display(), e))
     }
 }
 
@@ -135,17 +168,18 @@ mod tests {
     #[test]
     fn test_parse_simple_csv() {
         let csv = "name,age,city\nAlice,30,Madrid\nBob,25,Barcelona";
-        let table = CsvTable::parse(csv).unwrap();
+        let table = DataTable::parse_csv(csv).unwrap();
         assert_eq!(table.headers, vec!["name", "age", "city"]);
         assert_eq!(table.rows.len(), 2);
         assert_eq!(table.rows[0], vec!["Alice", "30", "Madrid"]);
         assert_eq!(table.rows[1], vec!["Bob", "25", "Barcelona"]);
+        assert_eq!(table.format, DataFormat::Csv);
     }
 
     #[test]
     fn test_parse_quoted_csv() {
         let csv = "name,bio\nAlice,\"likes, commas\"\nBob,\"says \"\"hello\"\"\"";
-        let table = CsvTable::parse(csv).unwrap();
+        let table = DataTable::parse_csv(csv).unwrap();
         assert_eq!(table.rows[0][1], "likes, commas");
         assert_eq!(table.rows[1][1], "says \"hello\"");
     }
@@ -153,7 +187,7 @@ mod tests {
     #[test]
     fn test_column_index() {
         let csv = "name,age,city\nAlice,30,Madrid";
-        let table = CsvTable::parse(csv).unwrap();
+        let table = DataTable::parse_csv(csv).unwrap();
         assert_eq!(table.column_index("age"), Some(1));
         assert_eq!(table.column_index("missing"), None);
     }
@@ -161,7 +195,7 @@ mod tests {
     #[test]
     fn test_append_row() {
         let csv = "name,age\nAlice,30";
-        let mut table = CsvTable::parse(csv).unwrap();
+        let mut table = DataTable::parse_csv(csv).unwrap();
         table.append_row(&["Bob".to_string(), "25".to_string()]).unwrap();
         assert_eq!(table.rows.len(), 2);
         assert_eq!(table.rows[1], vec!["Bob", "25"]);
@@ -170,9 +204,17 @@ mod tests {
     #[test]
     fn test_row_as_map() {
         let csv = "name,age\nAlice,30";
-        let table = CsvTable::parse(csv).unwrap();
+        let table = DataTable::parse_csv(csv).unwrap();
         let map = table.row_as_map(0);
         assert_eq!(map.get("name").unwrap(), "Alice");
         assert_eq!(map.get("age").unwrap(), "30");
+    }
+
+    #[test]
+    fn test_format_detection() {
+        assert_eq!(DataFormat::from_extension(Path::new("data.csv")).unwrap(), DataFormat::Csv);
+        assert_eq!(DataFormat::from_extension(Path::new("data.json")).unwrap(), DataFormat::Json);
+        assert!(DataFormat::from_extension(Path::new("data.xml")).is_err());
+        assert!(DataFormat::from_extension(Path::new("noext")).is_err());
     }
 }

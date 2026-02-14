@@ -77,7 +77,9 @@ impl TypeChecker {
     fn validate_stmt(&mut self, stmt: &Stmt, in_function: bool) {
         match stmt {
             Stmt::Let { type_ann, initializer, .. } => {
-                self.validate_type(type_ann);
+                if let Some(ta) = type_ann {
+                    self.validate_type(ta);
+                }
                 self.validate_expr(initializer);
             }
             Stmt::Assign { value, .. } => {

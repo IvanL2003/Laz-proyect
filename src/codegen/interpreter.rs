@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use crate::lexer::Span;
 use crate::parser::ast::*;
 use crate::utils::error::RuntimeError;
-use crate::utils::csv::CsvTable;
+use crate::utils::csv::DataTable;
 
 // --- Runtime Values ---
 
@@ -139,7 +139,7 @@ pub struct Interpreter {
     environment: Environment,
     functions: HashMap<String, FnDecl>,
     structs: HashMap<String, StructDecl>,
-    csv_aliases: HashMap<String, String>, // alias -> file path
+    alias: HashMap<String, String>, // alias -> file path
     base_dir: PathBuf,
 }
 
@@ -149,13 +149,13 @@ impl Interpreter {
             environment: Environment::new(),
             functions: HashMap::new(),
             structs: HashMap::new(),
-            csv_aliases: HashMap::new(),
+            alias: HashMap::new(),
             base_dir,
         }
     }
 
     pub fn run(&mut self, program: &Program) -> Result<(), RuntimeError> {
-        // Register all functions, structs, and csv connections
+        // Register all functions, structs, and file connections
         for decl in &program.declarations {
             match decl {
                 Declaration::Function(f) => {
@@ -165,7 +165,7 @@ impl Interpreter {
                     self.structs.insert(s.name.clone(), s.clone());
                 }
                 Declaration::Connect(c) => {
-                    self.csv_aliases.insert(c.alias.clone(), c.file_path.clone());
+                    self.alias.insert(c.alias.clone(), c.file_path.clone());
                 }
                 Declaration::Statement(_) => {}
             }
@@ -207,8 +207,18 @@ impl Interpreter {
     fn execute_stmt(&mut self, stmt: &Stmt) -> Result<StmtResult, RuntimeError> {
         match stmt {
             Stmt::Let { name, mutable, type_ann, initializer, span } => {
-                let value = self.evaluate_expr(initializer)?;
-                self.check_type_compat(&value, type_ann, *span)?;
+                let value = match initializer {
+                    Expr::SqlSelect { columns, table_ref, condition, single, span: sql_span } => {
+                        let use_string_mode = type_ann.as_ref()
+                            .map(|t| Self::is_primitive_list_type(t))
+                            .unwrap_or(false);
+                        self.execute_sql_select(columns, table_ref, condition.as_deref(), *single, *sql_span, use_string_mode)?
+                    }
+                    _ => self.evaluate_expr(initializer)?,
+                };
+                if let Some(ta) = type_ann {
+                    self.check_type_compat(&value, ta, *span)?;
+                }
                 self.environment.define(name.clone(), value, *mutable);
                 Ok(StmtResult::Normal)
             }
@@ -472,7 +482,7 @@ impl Interpreter {
             }
 
             Expr::SqlSelect { columns, table_ref, condition, single, span } => {
-                self.execute_sql_select(columns, table_ref, condition.as_deref(), *single, *span)
+                self.execute_sql_select(columns, table_ref, condition.as_deref(), *single, *span, false)
             }
 
             Expr::SqlInsert { table_ref, values, span } => {
@@ -483,24 +493,22 @@ impl Interpreter {
 
     // --- SQL Execution ---
 
-    fn resolve_csv_path(&self, table_ref: &SqlTableRef, _span: Span) -> Result<(PathBuf, String), RuntimeError> {
+    fn resolve_file_path(&self, table_ref: &SqlTableRef, span: Span) -> Result<(PathBuf, String), RuntimeError> {
         match table_ref {
             SqlTableRef::Alias(alias) => {
-                if let Some(file_path) = self.csv_aliases.get(alias) {
+                if let Some(file_path) = self.alias.get(alias) {
                     Ok((self.base_dir.join(file_path), alias.clone()))
                 } else {
-                    // Fallback: try alias.csv (backward compatible)
-                    Ok((self.base_dir.join(format!("{}.csv", alias)), alias.clone()))
+                    return Err(RuntimeError {
+                        message: format!("unknown table alias '{}'", alias),
+                        span,
+                    });
                 }
             }
             SqlTableRef::Inline(file_path) => {
-                let name = file_path
-                    .trim_end_matches(".csv")
-                    .rsplit('/')
-                    .next()
-                    .unwrap_or(file_path)
-                    .rsplit('\\')
-                    .next()
+                let path = std::path::Path::new(file_path);
+                let name = path.file_stem()
+                    .and_then(|s| s.to_str())
                     .unwrap_or(file_path)
                     .to_string();
                 Ok((self.base_dir.join(file_path), name))
@@ -508,7 +516,7 @@ impl Interpreter {
         }
     }
 
-    fn csv_value_to_laz(s: &str) -> Value {
+    fn cell_to_value(s: &str) -> Value {
         // Try int
         if let Ok(i) = s.parse::<i64>() {
             return Value::Int(i);
@@ -533,7 +541,7 @@ impl Interpreter {
 
         for (i, header) in headers.iter().enumerate() {
             if use_all || columns.contains(header) {
-                fields.insert(header.clone(), Self::csv_value_to_laz(&row[i]));
+                fields.insert(header.clone(), Self::cell_to_value(&row[i]));
             }
         }
 
@@ -543,7 +551,30 @@ impl Interpreter {
         }
     }
 
-    /// Find a declared struct whose fields match the given CSV headers
+    /// Convert a row to a list of string values (for list<list<string>> mode)
+    fn row_to_string_list(headers: &[String], row: &[String], columns: &[String]) -> Value {
+        let use_all = columns.len() == 1 && columns[0] == "*";
+        let values: Vec<Value> = if use_all {
+            row.iter().map(|s| Value::Str(s.clone())).collect()
+        } else {
+            columns.iter().filter_map(|col| {
+                headers.iter().position(|h| h == col)
+                    .map(|i| Value::Str(row[i].clone()))
+            }).collect()
+        };
+        Value::List(values)
+    }
+
+    /// Check if type_ann is a primitive list type (not struct-based)
+    fn is_primitive_list_type(type_ann: &TypeAnnotation) -> bool {
+        matches!(type_ann,
+            TypeAnnotation::List(inner) if matches!(inner.as_ref(),
+                TypeAnnotation::List(_) | TypeAnnotation::StringType | TypeAnnotation::Int | TypeAnnotation::Float | TypeAnnotation::Bool
+            )
+        )
+    }
+
+    /// Find a declared struct whose fields match the given table headers
     fn find_matching_struct(&self, headers: &[String], columns: &[String]) -> Option<String> {
         let use_all = columns.len() == 1 && columns[0] == "*";
         let target_fields: Vec<&String> = if use_all {
@@ -580,9 +611,10 @@ impl Interpreter {
         condition: Option<&Expr>,
         single: bool,
         span: Span,
+        use_string_mode: bool,
     ) -> Result<Value, RuntimeError> {
-        let (csv_path, table_name) = self.resolve_csv_path(table_ref, span)?;
-        let csv_table = CsvTable::from_file(&csv_path).map_err(|e| RuntimeError {
+        let (file_path, table_name) = self.resolve_file_path(table_ref, span)?;
+        let table = DataTable::from_file(&file_path).map_err(|e| RuntimeError {
             message: e,
             span,
         })?;
@@ -591,7 +623,7 @@ impl Interpreter {
         let use_all = columns.len() == 1 && columns[0] == "*";
         if !use_all {
             for col in columns {
-                if csv_table.column_index(col).is_none() {
+                if table.column_index(col).is_none() {
                     return Err(RuntimeError {
                         message: format!("column '{}' not found in table '{}'", col, table_name),
                         span,
@@ -600,18 +632,22 @@ impl Interpreter {
             }
         }
 
-        // Determine the struct type name to use for results
-        let struct_name = self.find_matching_struct(&csv_table.headers, columns)
-            .unwrap_or_else(|| table_name.clone());
+        // Determine the struct type name (only needed in struct mode)
+        let struct_name = if !use_string_mode {
+            self.find_matching_struct(&table.headers, columns)
+                .unwrap_or_else(|| table_name.clone())
+        } else {
+            String::new()
+        };
 
         let mut results = Vec::new();
 
-        for row_idx in 0..csv_table.rows.len() {
+        for row_idx in 0..table.rows.len() {
             let matches = if let Some(cond) = condition {
                 // Push a scope with column values as variables
                 self.environment.push_scope();
-                for (i, header) in csv_table.headers.iter().enumerate() {
-                    let val = Self::csv_value_to_laz(&csv_table.rows[row_idx][i]);
+                for (i, header) in table.headers.iter().enumerate() {
+                    let val = Self::cell_to_value(&table.rows[row_idx][i]);
                     self.environment.define(header.clone(), val, false);
                 }
                 let result = self.evaluate_expr(cond);
@@ -629,11 +665,15 @@ impl Interpreter {
             };
 
             if matches {
-                let row_struct = Self::row_to_struct(&struct_name, &csv_table.headers, &csv_table.rows[row_idx], columns);
+                let row_value = if use_string_mode {
+                    Self::row_to_string_list(&table.headers, &table.rows[row_idx], columns)
+                } else {
+                    Self::row_to_struct(&struct_name, &table.headers, &table.rows[row_idx], columns)
+                };
                 if single {
-                    return Ok(row_struct);
+                    return Ok(row_value);
                 }
-                results.push(row_struct);
+                results.push(row_value);
             }
         }
 
@@ -653,17 +693,17 @@ impl Interpreter {
         value_exprs: &[Expr],
         span: Span,
     ) -> Result<Value, RuntimeError> {
-        let (csv_path, _table_name) = self.resolve_csv_path(table_ref, span)?;
+        let (file_path, _table_name) = self.resolve_file_path(table_ref, span)?;
 
-        // Read existing table (or create if not exists)
-        let mut csv_table = if csv_path.exists() {
-            CsvTable::from_file(&csv_path).map_err(|e| RuntimeError {
+        // Read existing table
+        let mut table = if file_path.exists() {
+            DataTable::from_file(&file_path).map_err(|e| RuntimeError {
                 message: e,
                 span,
             })?
         } else {
             return Err(RuntimeError {
-                message: format!("CSV file '{}' does not exist", csv_path.display()),
+                message: format!("file '{}' does not exist", file_path.display()),
                 span,
             });
         };
@@ -678,7 +718,7 @@ impl Interpreter {
                 Value::Bool(v) => v.to_string(),
                 Value::Str(v) => v,
                 _ => return Err(RuntimeError {
-                    message: format!("cannot insert value of type '{}' into CSV", val.type_name()),
+                    message: format!("cannot insert value of type '{}'", val.type_name()),
                     span,
                 }),
             };
@@ -686,11 +726,11 @@ impl Interpreter {
         }
 
         // Append and save
-        if let Err(e) = csv_table.append_row(&row_values) {
+        if let Err(e) = table.append_row(&row_values) {
             return Err(RuntimeError { message: e, span });
         }
 
-        match csv_table.save_to_file(&csv_path) {
+        match table.save_to_file(&file_path) {
             Ok(()) => Ok(Value::Bool(true)),
             Err(e) => Err(RuntimeError { message: e, span }),
         }

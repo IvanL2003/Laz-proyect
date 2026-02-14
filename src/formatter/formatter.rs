@@ -135,9 +135,15 @@ impl Formatter {
     }
 
     fn format_connect(&mut self, decl: &ConnectDecl) {
+        let connect_keyword = match decl.connect_type {
+            crate::lexer::token::ConnectType::File => "file",
+            crate::lexer::token::ConnectType::Db => "db",
+            crate::lexer::token::ConnectType::Api => "api",
+        };
         self.output.push_str(&format!(
-            "{}connect file \"{}\" as {};\n",
+            "{}connect {} \"{}\" as {};\n",
             self.indent(),
+            connect_keyword,
             decl.file_path,
             decl.alias
         ));
@@ -262,12 +268,16 @@ impl Formatter {
                 span,
             } => {
                 let mut_kw = if *mutable { "mut " } else { "" };
+                let type_part = match type_ann {
+                    Some(ta) => format!(": {}", self.format_type(ta)),
+                    None => String::new(),
+                };
                 self.output.push_str(&format!(
-                    "{}let {}{}: {} = {};\n",
+                    "{}let {}{}{} = {};\n",
                     self.indent(),
                     mut_kw,
                     name,
-                    self.format_type(type_ann),
+                    type_part,
                     self.format_expr(initializer)
                 ));
                 self.emit_inline_comment(span.line);
@@ -586,7 +596,7 @@ impl Formatter {
     fn format_sql_table_ref(&self, table_ref: &SqlTableRef) -> String {
         match table_ref {
             SqlTableRef::Alias(alias) => alias.clone(),
-            SqlTableRef::Inline(path) => format!("csv(\"{}\")", path),
+            SqlTableRef::Inline(path) => format!("file(\"{}\")", path),
         }
     }
 
@@ -670,22 +680,22 @@ mod tests {
 
     #[test]
     fn test_sql_select() {
-        let input = "connect csv \"users.csv\" as users;\nstruct User { name: string, age: int, }\nfn main() -> void { let all: list<User> = #SELECT * FROM users; }";
+        let input = "connect file \"users.csv\" as users;\nstruct User { name: string, age: int, }\nfn main() -> void { let all: list<User> = #SELECT * FROM users; }";
         let result = format_code(input);
         assert!(result.contains("#SELECT * FROM users"));
     }
 
     #[test]
     fn test_sql_select_inline() {
-        let input = "struct User { name: string, }\nfn main() -> void { let all: list<User> = #SELECT * FROM csv(\"users.csv\"); }";
+        let input = "struct User { name: string, }\nfn main() -> void { let all: list<User> = #SELECT * FROM file(\"users.csv\"); }";
         let result = format_code(input);
-        assert!(result.contains("#SELECT * FROM csv(\"users.csv\")"));
+        assert!(result.contains("#SELECT * FROM file(\"users.csv\")"));
     }
 
     #[test]
-    fn test_connect_csv() {
-        let result = format_code("connect csv \"data.csv\" as data;");
-        assert!(result.contains("connect csv \"data.csv\" as data;\n"));
+    fn test_connect_file() {
+        let result = format_code("connect file \"data.csv\" as data;");
+        assert!(result.contains("connect file \"data.csv\" as data;\n"));
     }
 
     #[test]

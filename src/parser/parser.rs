@@ -292,8 +292,15 @@ impl Parser {
 
         let mutable = self.match_token(&TokenKind::Mut);
         let (name, _) = self.expect_ident()?;
-        self.expect(&TokenKind::Colon)?;
-        let type_ann = self.parse_type()?;
+
+        // Type annotation is optional: let x: int = 5; OR let x = 5;
+        let type_ann = if self.check(&TokenKind::Colon) {
+            self.advance(); // consume ':'
+            Some(self.parse_type()?)
+        } else {
+            None
+        };
+
         self.expect(&TokenKind::Equal)?;
         let initializer = self.parse_expression()?;
         self.expect(&TokenKind::Semicolon)?;

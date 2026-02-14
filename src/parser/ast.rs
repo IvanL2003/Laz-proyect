@@ -74,7 +74,7 @@ pub enum Stmt {
     Let {
         name: String,
         mutable: bool,
-        type_ann: TypeAnnotation,
+        type_ann: Option<TypeAnnotation>,
         initializer: Expr,
         span: Span,
     },
@@ -200,8 +200,8 @@ impl Expr {
 
 #[derive(Debug, Clone)]
 pub enum SqlTableRef {
-    Alias(String),              // FROM users (uses connect csv alias)
-    Inline(String),             // FROM csv("users.csv") (direct file path)
+    Alias(String),              // FROM users (uses connect alias)
+    Inline(String),             // FROM file("users.csv") (direct file path)
 }
 
 #[derive(Debug, Clone)]

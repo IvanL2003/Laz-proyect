@@ -24,6 +24,8 @@ fn main() -> void {
     print("--- Users from Madrid ---");
     let madrid: list<User> = #SELECT name, age FROM users WHERE city == "Madrid";
     print(madrid);
+    let madrid: list<list<string>> = #SELECT name, age FROM users WHERE city == "Madrid";
+    print(madrid);
 
     // SELECT SINGLE
     print("--- Find Bob ---");
@@ -51,6 +53,6 @@ fn main() -> void {
 
     // Verificar insert con file() inline
     print("--- After insert (inline) ---");
-    let updated: list<User> = #SELECT * FROM file("users copy.csv");
+    let updated = #SELECT * FROM file("users copy.csv");
     print(updated);
 }
