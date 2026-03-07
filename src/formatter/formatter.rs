@@ -306,7 +306,7 @@ impl Formatter {
             Stmt::If {
                 condition,
                 then_block,
-                else_branch,
+                else_block,
                 ..
             } => {
                 self.output.push_str(&format!(
@@ -317,27 +317,7 @@ impl Formatter {
                 self.indent_level += 1;
                 self.format_block_inner(then_block);
                 self.indent_level -= 1;
-
-                match else_branch {
-                    Some(branch) => match branch.as_ref() {
-                        ElseBranch::ElseIf(if_stmt) => {
-                            self.output
-                                .push_str(&format!("{}}} else ", self.indent()));
-                            self.format_if_continuation(if_stmt);
-                        }
-                        ElseBranch::ElseBlock(block) => {
-                            self.output
-                                .push_str(&format!("{}}} else {{\n", self.indent()));
-                            self.indent_level += 1;
-                            self.format_block_inner(block);
-                            self.indent_level -= 1;
-                            self.output.push_str(&format!("{}}}\n", self.indent()));
-                        }
-                    },
-                    None => {
-                        self.output.push_str(&format!("{}}}\n", self.indent()));
-                    }
-                }
+                self.format_else_block(else_block.as_ref());
             }
 
             Stmt::While {
@@ -437,41 +417,41 @@ impl Formatter {
         }
     }
 
-    fn format_if_continuation(&mut self, stmt: &Stmt) {
-        if let Stmt::If {
-            condition,
-            then_block,
-            else_branch,
-            ..
-        } = stmt
-        {
-            self.output.push_str(&format!(
-                "if {} {{\n",
-                self.format_expr(condition)
-            ));
-            self.indent_level += 1;
-            self.format_block_inner(then_block);
-            self.indent_level -= 1;
-
-            match else_branch {
-                Some(branch) => match branch.as_ref() {
-                    ElseBranch::ElseIf(if_stmt) => {
-                        self.output
-                            .push_str(&format!("{}}} else ", self.indent()));
-                        self.format_if_continuation(if_stmt);
-                    }
-                    ElseBranch::ElseBlock(block) => {
-                        self.output
-                            .push_str(&format!("{}}} else {{\n", self.indent()));
+    // Detecta si un else_block es un else-if desazucarado:
+    //   Some(Block { statements: [Stmt::If { ... }] }) → reconstruye como "else if ..."
+    //   Some(Block { statements: [...] })              → formatea como "else { ... }"
+    //   None                                           → cierra el if con "}"
+    fn format_else_block(&mut self, else_block: Option<&Block>) {
+        match else_block {
+            Some(block) => {
+                // Detectar el patron else-if: bloque con un unico Stmt::If
+                if block.statements.len() == 1 {
+                    if let Stmt::If { condition, then_block, else_block: inner_else, .. }
+                        = &block.statements[0]
+                    {
+                        // Reconstruir "else if cond { ... }"
+                        self.output.push_str(&format!(
+                            "{}}} else if {} {{\n",
+                            self.indent(),
+                            self.format_expr(condition)
+                        ));
                         self.indent_level += 1;
-                        self.format_block_inner(block);
+                        self.format_block_inner(then_block);
                         self.indent_level -= 1;
-                        self.output.push_str(&format!("{}}}\n", self.indent()));
+                        // Continuar la cadena recursivamente
+                        self.format_else_block(inner_else.as_ref());
+                        return;
                     }
-                },
-                None => {
-                    self.output.push_str(&format!("{}}}\n", self.indent()));
                 }
+                // else normal: bloque con varios statements o sin Stmt::If
+                self.output.push_str(&format!("{}}} else {{\n", self.indent()));
+                self.indent_level += 1;
+                self.format_block_inner(block);
+                self.indent_level -= 1;
+                self.output.push_str(&format!("{}}}\n", self.indent()));
+            }
+            None => {
+                self.output.push_str(&format!("{}}}\n", self.indent()));
             }
         }
     }

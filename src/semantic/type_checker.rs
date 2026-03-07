@@ -85,14 +85,13 @@ impl TypeChecker {
             Stmt::Assign { value, .. } => {
                 self.validate_expr(value);
             }
-            Stmt::If { condition, then_block, else_branch, .. } => {
+            Stmt::If { condition, then_block, else_block, .. } => {
                 self.validate_expr(condition);
                 self.validate_block(then_block, in_function);
-                if let Some(else_b) = else_branch {
-                    match else_b.as_ref() {
-                        ElseBranch::ElseBlock(block) => self.validate_block(block, in_function),
-                        ElseBranch::ElseIf(if_stmt) => self.validate_stmt(if_stmt, in_function),
-                    }
+                // else_block puede ser un else normal o un else-if desazucarado (else { if ... })
+                // En ambos casos basta con validar el bloque recursivamente
+                if let Some(block) = else_block {
+                    self.validate_block(block, in_function);
                 }
             }
             Stmt::While { condition, body, .. } => {
@@ -129,12 +128,25 @@ impl TypeChecker {
     fn validate_expr(&mut self, expr: &Expr) {
         match expr {
             Expr::FnCall { callee, args, span } => {
+                const BUILTINS: &[(&str, usize)] = &[("typeOf", 1)];
+                let builtin = BUILTINS.iter().find(|(name, _)| *name == callee.as_str());
+
                 if let Some(&expected_args) = self.functions.get(callee.as_str()) {
                     if args.len() != expected_args {
                         self.errors.push(SemanticError {
                             message: format!(
                                 "function '{}' expects {} arguments, got {}",
                                 callee, expected_args, args.len()
+                            ),
+                            span: *span,
+                        });
+                    }
+                } else if let Some(&(_, expected)) = builtin {
+                    if args.len() != expected {
+                        self.errors.push(SemanticError {
+                            message: format!(
+                                "built-in '{}' expects {} argument(s), got {}",
+                                callee, expected, args.len()
                             ),
                             span: *span,
                         });

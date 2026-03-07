@@ -319,13 +319,20 @@ impl Parser {
         let condition = self.parse_expression()?;
         let then_block = self.parse_block()?;
 
-        let else_branch = if self.match_token(&TokenKind::Else) {
+        // "else if" se desazucara a "else { if ... }"
+        // Ambos casos producen Option<Block>, eliminando ElseBranch por completo
+        let else_block = if self.match_token(&TokenKind::Else) {
             if self.check(&TokenKind::If) {
-                Some(Box::new(ElseBranch::ElseIf(Box::new(
-                    self.parse_if_stmt()?,
-                ))))
+                // else if cond { ... }  →  else { if cond { ... } }
+                let inner_if = self.parse_if_stmt()?;
+                let span = match &inner_if {
+                    Stmt::If { span, .. } => *span,
+                    _ => unreachable!(),
+                };
+                Some(Block { statements: vec![inner_if], span })
             } else {
-                Some(Box::new(ElseBranch::ElseBlock(self.parse_block()?)))
+                // else { ... }  →  bloque directo
+                Some(self.parse_block()?)
             }
         } else {
             None
@@ -334,7 +341,7 @@ impl Parser {
         Ok(Stmt::If {
             condition,
             then_block,
-            else_branch,
+            else_block,
             span: if_token.span,
         })
     }

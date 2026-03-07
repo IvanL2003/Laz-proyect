@@ -1,0 +1,21 @@
+fn clasificar(n: int) -> string {
+    if n < 0 {
+        return "negativo";
+    } else if n == 0 {
+        return "cero";
+    } else if n < 10 {
+        return "pequeno";
+    } else if n < 100 {
+        return "mediano";
+    } else {
+        return "grande";
+    }
+}
+
+fn main() -> void {
+    print(clasificar(-5));
+    print(clasificar(0));
+    print(clasificar(7));
+    print(clasificar(42));
+    print(clasificar(999));
+}

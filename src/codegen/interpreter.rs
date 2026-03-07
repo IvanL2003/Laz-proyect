@@ -1,3 +1,14 @@
+// --- Añadir función nativa typeOf ---
+fn native_type_of(args: Vec<Value>) -> Result<Value, RuntimeError> {
+    if args.len() != 1 {
+        return Err(RuntimeError {
+            message: format!("typeOf espera 1 argumento, recibió {}", args.len()),
+            span: Span { line: 0, column: 0, start: 0, end: 0 },
+        });
+    }
+    let type_name = args[0].type_name().to_string();
+    Ok(Value::Str(type_name))
+}
 use std::collections::HashMap;
 use std::path::PathBuf;
 use crate::lexer::Span;
@@ -7,6 +18,15 @@ use crate::utils::csv::DataTable;
 
 // --- Runtime Values ---
 
+// Valores posibles en tiempo de ejecucion.
+// Cada variante corresponde a un tipo del lenguaje:
+//   Int(i64)                             -->  int         ej: 42, -7
+//   Float(f64)                           -->  float       ej: 3.14, 1.0
+//   Bool(bool)                           -->  bool        ej: true, false
+//   Str(String)                          -->  string      ej: "hello"
+//   StructInstance { type_name, fields } -->  NombreStruct  ej: User { name: "Bob", age: 25 }
+//   List(Vec<Value>)                     -->  list<T>     ej: [User{...}, User{...}]
+//   Void                                 -->  void        (retorno de funciones sin valor)
 #[derive(Debug, Clone)]
 pub enum Value {
     Int(i64),
@@ -14,14 +34,18 @@ pub enum Value {
     Bool(bool),
     Str(String),
     StructInstance {
-        type_name: String,
-        fields: HashMap<String, Value>,
+        type_name: String,              // nombre del struct ej: "User", "Point"
+        fields: HashMap<String, Value>, // HashMap campo -> valor
     },
     List(Vec<Value>),
     Void,
 }
 
 impl Value {
+    // Devuelve el nombre del tipo como string (usado por typeOf y mensajes de error)
+    // Int   --> "int"  |  Float --> "float"  |  Bool   --> "bool"
+    // Str   --> "string"  |  List  --> "list"   |  Void   --> "void"
+    // StructInstance --> nombre del struct ej: "User", "Point"
     fn type_name(&self) -> &str {
         match self {
             Value::Int(_) => "int",
@@ -64,11 +88,27 @@ impl Value {
 
 // --- Environment ---
 
+// Una variable almacena su valor y si es mutable (let mut) o no (let)
 struct Variable {
     value: Value,
-    mutable: bool,
+    mutable: bool, // true si fue declarada con `let mut`
 }
 
+// Pila de scopes (HashMap) para manejar el alcance de variables.
+// Estructura: [scope_global, scope_funcion, scope_bloque, ...]
+//
+// Ejemplo para este codigo:
+//   let x = 1;          --> scope global: { x: Int(1) }
+//   fn foo() {
+//     let y = 2;        --> scope funcion: { y: Int(2) }
+//     if true {
+//       let z = 3;      --> scope bloque: { z: Int(3) }
+//     }                 --> pop scope bloque
+//   }                   --> pop scope funcion
+//
+// get() busca de mas interno a mas externo (shadowing natural)
+// set() busca y verifica mutabilidad antes de modificar
+// define() inserta en el scope mas interno (el ultimo)
 struct Environment {
     scopes: Vec<HashMap<String, Variable>>,
 }
@@ -76,24 +116,29 @@ struct Environment {
 impl Environment {
     fn new() -> Self {
         Environment {
-            scopes: vec![HashMap::new()],
+            scopes: vec![HashMap::new()], // siempre hay al menos el scope global
         }
     }
 
+    // Entra en un nuevo bloque/funcion
     fn push_scope(&mut self) {
         self.scopes.push(HashMap::new());
     }
 
+    // Sale del bloque/funcion actual (destruye todas sus variables)
     fn pop_scope(&mut self) {
         self.scopes.pop();
     }
 
+    // Declara una nueva variable en el scope actual (let / let mut)
     fn define(&mut self, name: String, value: Value, mutable: bool) {
         if let Some(scope) = self.scopes.last_mut() {
             scope.insert(name, Variable { value, mutable });
         }
     }
 
+    // Busca una variable recorriendo scopes de mas interno a mas externo
+    // Error si no existe en ningun scope
     fn get(&self, name: &str, span: Span) -> Result<Value, RuntimeError> {
         for scope in self.scopes.iter().rev() {
             if let Some(var) = scope.get(name) {
@@ -106,6 +151,8 @@ impl Environment {
         })
     }
 
+    // Modifica una variable existente (solo si es mutable)
+    // Busca de mas interno a mas externo igual que get()
     fn set(&mut self, name: &str, value: Value, span: Span) -> Result<(), RuntimeError> {
         for scope in self.scopes.iter_mut().rev() {
             if let Some(var) = scope.get_mut(name) {
@@ -141,16 +188,20 @@ pub struct Interpreter {
     structs: HashMap<String, StructDecl>,
     alias: HashMap<String, String>, // alias -> file path
     base_dir: PathBuf,
+    native_functions: HashMap<String, fn(Vec<Value>) -> Result<Value, RuntimeError>>,
 }
 
 impl Interpreter {
     pub fn new(base_dir: PathBuf) -> Self {
+        let mut native_functions = HashMap::new();
+        native_functions.insert("typeOf".to_string(), native_type_of as fn(Vec<Value>) -> Result<Value, RuntimeError>);
         Interpreter {
             environment: Environment::new(),
             functions: HashMap::new(),
             structs: HashMap::new(),
             alias: HashMap::new(),
             base_dir,
+            native_functions,
         }
     }
 
@@ -206,14 +257,22 @@ impl Interpreter {
 
     fn execute_stmt(&mut self, stmt: &Stmt) -> Result<StmtResult, RuntimeError> {
         match stmt {
+            // let x: int = 42;           mutable=false, type_ann=Some(Int)
+            // let mut count = 0;         mutable=true,  type_ann=None (inferido)
+            // let data = #SELECT * ...;  initializer=SqlSelect (caso especial: mode string/struct)
+            // Si type_ann es None no se verifica compatibilidad de tipos
             Stmt::Let { name, mutable, type_ann, initializer, span } => {
                 let value = match initializer {
+                    // Inicializador SQL: determina use_string_mode segun el tipo anotado
+                    // list<list<string>> o list<primitivo> --> string mode (todo como strings)
+                    // list<Struct> o sin tipo --> struct mode (convierte a StructInstance)
                     Expr::SqlSelect { columns, table_ref, condition, single, span: sql_span } => {
                         let use_string_mode = type_ann.as_ref()
                             .map(|t| Self::is_primitive_list_type(t))
                             .unwrap_or(false);
                         self.execute_sql_select(columns, table_ref, condition.as_deref(), *single, *sql_span, use_string_mode)?
                     }
+                    // Cualquier otra expresion: se evalua normalmente
                     _ => self.evaluate_expr(initializer)?,
                 };
                 if let Some(ta) = type_ann {
@@ -223,12 +282,17 @@ impl Interpreter {
                 Ok(StmtResult::Normal)
             }
 
+            // x = 5;       AssignTarget::Variable("x")
+            // p.x = 1.0;   AssignTarget::FieldAccess { object=Identifier("p"), field="x" }
+            // Para FieldAccess: get struct → modifica campo → set struct de vuelta
             Stmt::Assign { target, value, span } => {
                 let val = self.evaluate_expr(value)?;
                 match target {
+                    // Reasignacion simple de variable (debe ser mut)
                     AssignTarget::Variable(name) => {
                         self.environment.set(name, val, *span)?;
                     }
+                    // Reasignacion de campo de struct (solo un nivel de profundidad)
                     AssignTarget::FieldAccess { object, field } => {
                         // We need to get the struct, modify the field, and set it back
                         if let Expr::Identifier { name, .. } = object.as_ref() {
@@ -260,7 +324,15 @@ impl Interpreter {
                 Ok(StmtResult::Normal)
             }
 
-            Stmt::If { condition, then_block, else_branch, span } => {
+            // if cond { ... }
+            // if cond1 { ... } else if cond2 { ... } else if cond3 { ... } else { ... }
+            //
+            // "else if" fue desazucarado por el parser a else { if ... }
+            // por lo que else_block es simplemente Option<Block>:
+            //   None       = sin rama else
+            //   Some(block)= else o else-if (el bloque puede contener un Stmt::If anidado)
+            // La condicion siempre debe ser bool.
+            Stmt::If { condition, then_block, else_block, span } => {
                 let cond = self.evaluate_expr(condition)?;
                 let cond_bool = match cond {
                     Value::Bool(b) => b,
@@ -272,16 +344,17 @@ impl Interpreter {
 
                 if cond_bool {
                     self.execute_block(then_block)
-                } else if let Some(else_b) = else_branch {
-                    match else_b.as_ref() {
-                        ElseBranch::ElseBlock(block) => self.execute_block(block),
-                        ElseBranch::ElseIf(if_stmt) => self.execute_stmt(if_stmt),
-                    }
+                } else if let Some(block) = else_block {
+                    // Ejecuta el bloque else (que puede contener un if anidado en caso de else-if)
+                    self.execute_block(block)
                 } else {
                     Ok(StmtResult::Normal)
                 }
             }
 
+            // while cond { ... }
+            // La condicion DEBE ser bool; itera hasta que sea false
+            // Si el cuerpo tiene return, propaga hacia arriba (StmtResult::Return)
             Stmt::While { condition, body, span } => {
                 loop {
                     let cond = self.evaluate_expr(condition)?;
@@ -305,6 +378,9 @@ impl Interpreter {
                 Ok(StmtResult::Normal)
             }
 
+            // for i in 1..10 { ... }
+            // variable="i"  start y end DEBEN ser int; end es EXCLUSIVO (como Rust)
+            // La variable del bucle es inmutable y solo existe dentro del cuerpo
             Stmt::For { variable, start, end, body, span } => {
                 let start_val = self.evaluate_expr(start)?;
                 let end_val = self.evaluate_expr(end)?;
@@ -318,6 +394,7 @@ impl Interpreter {
                 };
 
                 for i in start_i..end_i {
+                    // Nuevo scope por iteracion para aislar la variable del bucle
                     self.environment.push_scope();
                     self.environment.define(variable.clone(), Value::Int(i), false);
                     let result = self.execute_block_inner(body);
@@ -331,6 +408,9 @@ impl Interpreter {
                 Ok(StmtResult::Normal)
             }
 
+            // return 42;   value=Some(expr)   --> StmtResult::Return(Value)
+            // return;      value=None          --> StmtResult::Return(Void)
+            // StmtResult::Return burbujea hasta call_function, que lo extrae
             Stmt::Return { value, .. } => {
                 let val = match value {
                     Some(expr) => self.evaluate_expr(expr)?,
@@ -339,6 +419,9 @@ impl Interpreter {
                 Ok(StmtResult::Return(val))
             }
 
+            // print(arg1, arg2, ...);
+            // Evalua cada arg y llama to_display_string(), luego imprime separados por espacio
+            // Es un statement, no una funcion: no retorna valor
             Stmt::Print { args, .. } => {
                 let values: Vec<String> = args
                     .iter()
@@ -348,6 +431,8 @@ impl Interpreter {
                 Ok(StmtResult::Normal)
             }
 
+            // fn_call();  o cualquier expresion usada como statement
+            // El valor de retorno se evalua pero se descarta (no se guarda en ninguna variable)
             Stmt::Expression { expr, .. } => {
                 self.evaluate_expr(expr)?;
                 Ok(StmtResult::Normal)
@@ -357,17 +442,26 @@ impl Interpreter {
 
     fn evaluate_expr(&mut self, expr: &Expr) -> Result<Value, RuntimeError> {
         match expr {
+            // 42, -7  -->  Value::Int(i64)
             Expr::IntLiteral { value, .. } => Ok(Value::Int(*value)),
+            // 3.14, 1.0  -->  Value::Float(f64)
             Expr::FloatLiteral { value, .. } => Ok(Value::Float(*value)),
+            // "hello"  -->  Value::Str(String)
             Expr::StringLiteral { value, .. } => Ok(Value::Str(value.clone())),
+            // true / false  -->  Value::Bool(bool)
             Expr::BoolLiteral { value, .. } => Ok(Value::Bool(*value)),
 
+            // x, name, users  -->  busca la variable en el Environment (scope mas interno primero)
             Expr::Identifier { name, span } => {
                 self.environment.get(name, *span)
             }
 
+            // (expr)  -->  simplemente evalua la expresion interior, el agrupamiento no cambia el valor
             Expr::Grouped { expr, .. } => self.evaluate_expr(expr),
 
+            // Operadores unarios:
+            //   UnaryOp::Neg --> -x  (int o float; error si otro tipo)
+            //   UnaryOp::Not --> !x  (solo bool; error si otro tipo)
             Expr::UnaryOp { op, operand, span } => {
                 let val = self.evaluate_expr(operand)?;
                 match op {
@@ -389,6 +483,11 @@ impl Interpreter {
                 }
             }
 
+            // left op right
+            // && y || tienen evaluacion short-circuit: no evalua right si el resultado ya es seguro
+            //   a && b --> si a es false, devuelve false sin evaluar b
+            //   a || b --> si a es true,  devuelve true  sin evaluar b
+            // El resto de operadores (+, -, *, /, %, ==, !=, <, <=, >, >=) van a eval_binary_op
             Expr::BinaryOp { left, op, right, span } => {
                 // Short-circuit for logical operators
                 if matches!(op, BinaryOp::And | BinaryOp::Or) {
@@ -429,6 +528,9 @@ impl Interpreter {
                 }
             }
 
+            // nombre(arg1, arg2, ...)
+            // callee es el nombre; args se evaluan en orden antes de llamar
+            // call_function busca primero en native_functions (typeOf), luego en functions del usuario
             Expr::FnCall { callee, args, span } => {
                 let arg_values: Vec<Value> = args
                     .iter()
@@ -437,6 +539,8 @@ impl Interpreter {
                 self.call_function(callee, arg_values, *span)
             }
 
+            // objeto.campo   ej: p.x, user.name
+            // Evalua object (debe ser StructInstance) y extrae el campo por nombre
             Expr::FieldAccess { object, field, span } => {
                 let obj = self.evaluate_expr(object)?;
                 match obj {
@@ -453,6 +557,12 @@ impl Interpreter {
                 }
             }
 
+            // NombreStruct { campo1: expr1, campo2: expr2 }
+            // ej: Point { x: 1.0, y: 2.0 }
+            // 1. Busca la definicion del struct para verificar que existe
+            // 2. Evalua cada expresion de campo
+            // 3. Verifica que esten todos los campos declarados
+            // 4. Devuelve Value::StructInstance { type_name, fields: HashMap }
             Expr::StructInit { name, fields, span } => {
                 let struct_decl = self.structs.get(name).cloned().ok_or_else(|| RuntimeError {
                     message: format!("undefined struct '{}'", name),
@@ -481,10 +591,15 @@ impl Interpreter {
                 })
             }
 
+            // #SELECT cols FROM tabla WHERE cond
+            // Cuando aparece en una expresion (no en let), siempre usa struct mode (use_string_mode=false)
+            // Para string mode, el Stmt::Let lo llama directamente con use_string_mode=true
             Expr::SqlSelect { columns, table_ref, condition, single, span } => {
                 self.execute_sql_select(columns, table_ref, condition.as_deref(), *single, *span, false)
             }
 
+            // #INSERT INTO tabla VALUES (expr1, expr2, ...)
+            // Evalua las expresiones de values y las convierte a strings para el DataTable
             Expr::SqlInsert { table_ref, values, span } => {
                 self.execute_sql_insert(table_ref, values, *span)
             }
@@ -493,6 +608,9 @@ impl Interpreter {
 
     // --- SQL Execution ---
 
+    // Resuelve un SqlTableRef a (PathBuf, nombre_tabla):
+    //   Alias("users")       -->  busca en self.alias["users"] --> base_dir + "users.csv"
+    //   Inline("data.csv")   -->  usa la ruta directamente      --> base_dir + "data.csv"
     fn resolve_file_path(&self, table_ref: &SqlTableRef, span: Span) -> Result<(PathBuf, String), RuntimeError> {
         match table_ref {
             SqlTableRef::Alias(alias) => {
@@ -516,6 +634,11 @@ impl Interpreter {
         }
     }
 
+    // Convierte una celda del CSV (String) al Value mas especifico posible:
+    //   "42"    --> Value::Int(42)
+    //   "3.14"  --> Value::Float(3.14)
+    //   "true"  --> Value::Bool(true)
+    //   "Alice" --> Value::Str("Alice")   (fallback)
     fn cell_to_value(s: &str) -> Value {
         // Try int
         if let Ok(i) = s.parse::<i64>() {
@@ -829,6 +952,11 @@ impl Interpreter {
     }
 
     fn call_function(&mut self, name: &str, args: Vec<Value>, span: Span) -> Result<Value, RuntimeError> {
+        // Primero busca funciones nativas
+        if let Some(native_fn) = self.native_functions.get(name) {
+            return native_fn(args);
+        }
+
         let func = self.functions.get(name).cloned().ok_or_else(|| RuntimeError {
             message: format!("undefined function '{}'", name),
             span,
