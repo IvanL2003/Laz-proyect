@@ -53,6 +53,7 @@ impl TypeChecker {
                 }
                 Declaration::Connect(_) => {}
                 Declaration::Statement(_) => {}
+                Declaration::Import { .. } => {}
             }
         }
     }
@@ -64,6 +65,7 @@ impl TypeChecker {
                 Declaration::Struct(_) => {}
                 Declaration::Connect(_) => {}
                 Declaration::Statement(stmt) => self.validate_stmt(stmt, false),
+                Declaration::Import { .. } => {} // el interprete maneja la carga
             }
         }
     }
@@ -122,13 +124,25 @@ impl TypeChecker {
             Stmt::Expression { expr, .. } => {
                 self.validate_expr(expr);
             }
+            Stmt::Match { subject, arms, .. } => {
+                self.validate_expr(subject);
+                for arm in arms {
+                    self.validate_block(&arm.body, in_function);
+                }
+            }
         }
     }
 
     fn validate_expr(&mut self, expr: &Expr) {
         match expr {
             Expr::FnCall { callee, args, span } => {
-                const BUILTINS: &[(&str, usize)] = &[("typeOf", 1)];
+                const BUILTINS: &[(&str, usize)] = &[
+            ("typeOf", 1),
+            ("len", 1), ("push", 2), ("pop", 1),
+            ("toString", 1), ("parseInt", 1), ("toFloat", 1),
+            ("ok", 1), ("err", 1), ("some", 1), ("none", 0),
+            ("unwrap", 1), ("is_ok", 1), ("is_err", 1), ("is_some", 1), ("is_none", 1),
+        ];
                 let builtin = BUILTINS.iter().find(|(name, _)| *name == callee.as_str());
 
                 if let Some(&expected_args) = self.functions.get(callee.as_str()) {
@@ -213,6 +227,15 @@ impl TypeChecker {
                     self.validate_expr(val);
                 }
             }
+            Expr::ListLiteral { elements, .. } => {
+                for elem in elements {
+                    self.validate_expr(elem);
+                }
+            }
+            Expr::Index { object, index, .. } => {
+                self.validate_expr(object);
+                self.validate_expr(index);
+            }
             // Literals and identifiers - nothing to validate at this stage
             _ => {}
         }
@@ -227,6 +250,13 @@ impl TypeChecker {
                 }
             }
             TypeAnnotation::List(inner) => {
+                self.validate_type(inner);
+            }
+            TypeAnnotation::Result(ok_t, err_t) => {
+                self.validate_type(ok_t);
+                self.validate_type(err_t);
+            }
+            TypeAnnotation::Option(inner) => {
                 self.validate_type(inner);
             }
             _ => {}

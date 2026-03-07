@@ -12,6 +12,8 @@ pub enum Declaration {
     Struct(StructDecl),
     Connect(ConnectDecl),
     Statement(Stmt),
+    // import "otro_archivo.lz";
+    Import { path: String, span: Span },
 }
 
 // connect file "users.csv" as users;
@@ -69,6 +71,8 @@ pub struct StructField {
 //   StringType           -->  string
 //   Void                 -->  void
 //   List(T)              -->  list<T>   ej: list<User>, list<list<string>>
+//   Result(T, E)         -->  Result<T, E>  ej: Result<int, string>
+//   Option(T)            -->  Option<T>     ej: Option<float>
 //   UserDefined(String)  -->  nombre de struct   ej: User, Point
 #[derive(Debug, Clone, PartialEq)]
 pub enum TypeAnnotation {
@@ -77,8 +81,10 @@ pub enum TypeAnnotation {
     Bool,
     StringType,
     Void,
-    List(Box<TypeAnnotation>), // list<T>  →  el T es otro TypeAnnotation anidado
-    UserDefined(String),       // nombre del struct, ej: "User", "Point"
+    List(Box<TypeAnnotation>),                                    // list<T>
+    Result(Box<TypeAnnotation>, Box<TypeAnnotation>),             // Result<T, E>
+    Option(Box<TypeAnnotation>),                                  // Option<T>
+    UserDefined(String),                                          // nombre del struct
 }
 
 #[derive(Debug, Clone)]
@@ -89,9 +95,11 @@ pub struct Block {
 
 #[derive(Debug, Clone)]
 pub enum Stmt {
-    // let x: int = 42;         mutable=false, type_ann=Some(Int),  initializer=IntLiteral(42)
-    // let mut count = 0;        mutable=true,  type_ann=None (inferido)
-    // let data = #SELECT * ...; type_ann=None, initializer=SqlSelect{...}
+    // let x: int = 42;   mutable=false, type_ann=Some(Int), initializer=IntLiteral(42)
+    // let mut count = 0;  mutable=true,  type_ann=None,      initializer=IntLiteral(0)
+    //
+    // initializer es cualquier Expr (incluido SqlSelect, FnCall, etc.)
+    // Si hay type_ann, se verifica compatibilidad despues de evaluar el initializer.
     Let {
         name: String,
         mutable: bool,
@@ -166,14 +174,49 @@ pub enum Stmt {
         expr: Expr,
         span: Span,
     },
+
+    // match expr { pattern => { ... } ... }
+    // Cada arm vincula variables del pattern en su body.
+    // ej: match result { ok(v) => { print(v); } err(e) => { print(e); } }
+    Match {
+        subject: Expr,
+        arms: Vec<MatchArm>,
+        span: Span,
+    },
 }
 
 // x = 5;      -->  Variable("x")
 // p.x = 1.0;  -->  FieldAccess { object=Identifier("p"), field="x" }
+// arr[i] = v; -->  Index { object="arr", index=Identifier("i") }
 #[derive(Debug, Clone)]
 pub enum AssignTarget {
     Variable(String),
     FieldAccess { object: Box<Expr>, field: String },
+    Index { object: String, index: Box<Expr> },
+}
+
+// Un arm de match: pattern => { body }
+#[derive(Debug, Clone)]
+pub struct MatchArm {
+    pub pattern: Pattern,
+    pub body: Block,
+}
+
+// Patron de match
+//   Ok(x)   --> ok(x)    extrae el valor Ok y lo bindea como x
+//   Err(x)  --> err(x)   extrae el valor Err y lo bindea como x
+//   Some(x) --> some(x)  extrae el valor Some y lo bindea como x
+//   None    --> none      sin binding
+//   Wildcard --> _        case default, sin binding
+//   Ident(x) --> x        bindea cualquier valor como x (como wildcard con nombre)
+#[derive(Debug, Clone)]
+pub enum Pattern {
+    Ok(String),
+    Err(String),
+    Some(String),
+    None,
+    Wildcard,
+    Ident(String),
 }
 
 #[derive(Debug, Clone)]
@@ -246,6 +289,22 @@ pub enum Expr {
         span: Span,
     },
 
+    // [e1, e2, e3]
+    // ej: [1, 2, 3]  -->  ListLiteral { elements=[IntLiteral(1), IntLiteral(2), IntLiteral(3)] }
+    // lista vacia: []
+    ListLiteral {
+        elements: Vec<Expr>,
+        span: Span,
+    },
+
+    // objeto[indice]
+    // ej: arr[0],  users[i],  matrix[j]
+    Index {
+        object: Box<Expr>,
+        index: Box<Expr>,
+        span: Span,
+    },
+
     // #SELECT cols FROM tabla WHERE cond
     // #SELECT SINGLE * FROM users WHERE name == "Bob"
     // #SELECT name, age FROM file("data.csv") WHERE age > 18
@@ -286,6 +345,8 @@ impl Expr {
             | Expr::FieldAccess { span, .. }
             | Expr::StructInit { span, .. }
             | Expr::Grouped { span, .. }
+            | Expr::ListLiteral { span, .. }
+            | Expr::Index { span, .. }
             | Expr::SqlSelect { span, .. }
             | Expr::SqlInsert { span, .. } => *span,
         }

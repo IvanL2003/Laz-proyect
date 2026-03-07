@@ -95,6 +95,20 @@ impl Parser {
             TokenKind::Fn => Ok(Declaration::Function(self.parse_fn_decl()?)),
             TokenKind::Struct => Ok(Declaration::Struct(self.parse_struct_decl()?)),
             TokenKind::Connect => Ok(Declaration::Connect(self.parse_connect()?)),
+            TokenKind::Import => {
+                let import_token = self.advance(); // consume 'import'
+                let path = match self.advance().kind {
+                    TokenKind::StringLiteral(s) => s,
+                    other => return Err(ParseError {
+                        message: format!("expected file path string after 'import', found '{}'", other),
+                        expected: "string literal".to_string(),
+                        found: format!("{}", other),
+                        span: import_token.span,
+                    }),
+                };
+                self.expect(&TokenKind::Semicolon)?;
+                Ok(Declaration::Import { path, span: import_token.span })
+            }
             _ => Ok(Declaration::Statement(self.parse_statement()?)),
         }
     }
@@ -250,6 +264,22 @@ impl Parser {
                 self.expect(&TokenKind::Greater)?;
                 Ok(TypeAnnotation::List(Box::new(inner)))
             }
+            TokenKind::Ident(name) if name == "Result" => {
+                // Result<T, E>
+                self.expect(&TokenKind::Less)?;
+                let ok_type = self.parse_type()?;
+                self.expect(&TokenKind::Comma)?;
+                let err_type = self.parse_type()?;
+                self.expect(&TokenKind::Greater)?;
+                Ok(TypeAnnotation::Result(Box::new(ok_type), Box::new(err_type)))
+            }
+            TokenKind::Ident(name) if name == "Option" => {
+                // Option<T>
+                self.expect(&TokenKind::Less)?;
+                let inner = self.parse_type()?;
+                self.expect(&TokenKind::Greater)?;
+                Ok(TypeAnnotation::Option(Box::new(inner)))
+            }
             TokenKind::Ident(name) => Ok(TypeAnnotation::UserDefined(name)),
             _ => Err(ParseError {
                 message: format!("expected type, found '{}'", token.kind),
@@ -283,6 +313,7 @@ impl Parser {
             TokenKind::For => self.parse_for_stmt(),
             TokenKind::Return => self.parse_return_stmt(),
             TokenKind::Print => self.parse_print_stmt(),
+            TokenKind::Match => self.parse_match_stmt(),
             _ => self.parse_assign_or_expr_stmt(),
         }
     }
@@ -429,10 +460,23 @@ impl Parser {
                 Expr::FieldAccess { object, field, .. } => {
                     AssignTarget::FieldAccess { object, field }
                 }
+                Expr::Index { object, index, .. } => {
+                    // arr[i] = val  →  solo soportamos variable directa como objeto
+                    if let Expr::Identifier { name, .. } = *object {
+                        AssignTarget::Index { object: name, index }
+                    } else {
+                        return Err(ParseError {
+                            message: "index assignment only supported on direct variables".to_string(),
+                            expected: "variable".to_string(),
+                            found: "expression".to_string(),
+                            span,
+                        });
+                    }
+                }
                 _ => {
                     return Err(ParseError {
                         message: "invalid assignment target".to_string(),
-                        expected: "variable or field".to_string(),
+                        expected: "variable, field or index".to_string(),
                         found: "expression".to_string(),
                         span,
                     });
@@ -709,6 +753,22 @@ impl Parser {
                     field,
                     span,
                 };
+            } else if self.check(&TokenKind::LeftBracket) {
+                // expr[index]
+                self.advance(); // consume '['
+                let index = self.parse_expression()?;
+                let close = self.expect(&TokenKind::RightBracket)?;
+                let span = Span {
+                    line: expr.span().line,
+                    column: expr.span().column,
+                    start: expr.span().start,
+                    end: close.span.end,
+                };
+                expr = Expr::Index {
+                    object: Box::new(expr),
+                    index: Box::new(index),
+                    span,
+                };
             } else {
                 break;
             }
@@ -808,6 +868,31 @@ impl Parser {
             TokenKind::Hash => {
                 self.advance(); // consume '#'
                 self.parse_sql_expr(token.span)
+            }
+            TokenKind::LeftBracket => {
+                // [e1, e2, e3]  o  []
+                self.advance(); // consume '['
+                let mut elements = Vec::new();
+                if !self.check(&TokenKind::RightBracket) {
+                    loop {
+                        elements.push(self.parse_expression()?);
+                        if !self.match_token(&TokenKind::Comma) {
+                            break;
+                        }
+                        // trailing comma antes de ] es valido
+                        if self.check(&TokenKind::RightBracket) {
+                            break;
+                        }
+                    }
+                }
+                let close = self.expect(&TokenKind::RightBracket)?;
+                let span = Span {
+                    line: token.span.line,
+                    column: token.span.column,
+                    start: token.span.start,
+                    end: close.span.end,
+                };
+                Ok(Expr::ListLiteral { elements, span })
             }
             _ => Err(ParseError {
                 message: format!("expected expression, found '{}'", token.kind),
@@ -965,6 +1050,62 @@ impl Parser {
             // Alias (identifier)
             let (alias, _) = self.expect_ident()?;
             Ok(SqlTableRef::Alias(alias))
+        }
+    }
+
+    // --- match statement ---
+
+    fn parse_match_stmt(&mut self) -> Result<Stmt, ParseError> {
+        let match_token = self.advance(); // consume 'match'
+        let subject = self.parse_expression()?;
+        self.expect(&TokenKind::LeftBrace)?;
+
+        let mut arms = Vec::new();
+        while !self.check(&TokenKind::RightBrace) && !self.is_at_end() {
+            let pattern = self.parse_pattern()?;
+            self.expect(&TokenKind::FatArrow)?;
+            let body = self.parse_block()?;
+            arms.push(MatchArm { pattern, body });
+        }
+        self.expect(&TokenKind::RightBrace)?;
+
+        Ok(Stmt::Match {
+            subject,
+            arms,
+            span: match_token.span,
+        })
+    }
+
+    fn parse_pattern(&mut self) -> Result<Pattern, ParseError> {
+        let token = self.peek().clone();
+        match &token.kind {
+            TokenKind::Ident(name) => {
+                let name = name.clone();
+                self.advance();
+                match name.as_str() {
+                    "_" => Ok(Pattern::Wildcard),
+                    "ok" | "err" | "some" => {
+                        // ok(x), err(e), some(x)  →  con binding
+                        self.expect(&TokenKind::LeftParen)?;
+                        let (bind, _) = self.expect_ident()?;
+                        self.expect(&TokenKind::RightParen)?;
+                        match name.as_str() {
+                            "ok"   => Ok(Pattern::Ok(bind)),
+                            "err"  => Ok(Pattern::Err(bind)),
+                            "some" => Ok(Pattern::Some(bind)),
+                            _      => unreachable!(),
+                        }
+                    }
+                    "none" => Ok(Pattern::None),
+                    other  => Ok(Pattern::Ident(other.to_string())),
+                }
+            }
+            _ => Err(ParseError {
+                message: format!("expected pattern, found '{}'", token.kind),
+                expected: "ok(x), err(e), some(x), none, _ or identifier".to_string(),
+                found: format!("{}", token.kind),
+                span: token.span,
+            }),
         }
     }
 

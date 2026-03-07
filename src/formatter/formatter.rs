@@ -103,6 +103,7 @@ impl Formatter {
                 Declaration::Struct(_) => "struct",
                 Declaration::Connect(_) => "connect",
                 Declaration::Statement(_) => "stmt",
+                Declaration::Import { .. } => "import",
             };
             if let Some(prev) = prev_decl_kind {
                 if prev != current_kind || current_kind == "fn" {
@@ -122,6 +123,7 @@ impl Formatter {
             Declaration::Struct(s) => s.span,
             Declaration::Connect(c) => c.span,
             Declaration::Statement(s) => self.stmt_span(s),
+            Declaration::Import { span, .. } => *span,
         }
     }
 
@@ -131,6 +133,10 @@ impl Formatter {
             Declaration::Struct(s) => self.format_struct_decl(s, next_decl_line),
             Declaration::Connect(c) => self.format_connect(c),
             Declaration::Statement(s) => self.format_statement(s),
+            Declaration::Import { path, span } => {
+                self.output.push_str(&format!("{}import \"{}\";\n", self.indent(), path));
+                self.emit_inline_comment(span.line);
+            }
         }
     }
 
@@ -212,6 +218,10 @@ impl Formatter {
             TypeAnnotation::StringType => "string".to_string(),
             TypeAnnotation::Void => "void".to_string(),
             TypeAnnotation::List(inner) => format!("list<{}>", self.format_type(inner)),
+            TypeAnnotation::Result(ok_t, err_t) => {
+                format!("Result<{}, {}>", self.format_type(ok_t), self.format_type(err_t))
+            }
+            TypeAnnotation::Option(inner) => format!("Option<{}>", self.format_type(inner)),
             TypeAnnotation::UserDefined(name) => name.clone(),
         }
     }
@@ -292,6 +302,9 @@ impl Formatter {
                     AssignTarget::Variable(name) => name.clone(),
                     AssignTarget::FieldAccess { object, field } => {
                         format!("{}.{}", self.format_expr(object), field)
+                    }
+                    AssignTarget::Index { object, index } => {
+                        format!("{}[{}]", object, self.format_expr(index))
                     }
                 };
                 self.output.push_str(&format!(
@@ -395,6 +408,26 @@ impl Formatter {
                 ));
                 self.emit_inline_comment(span.line);
             }
+
+            Stmt::Match { subject, arms, span } => {
+                self.output.push_str(&format!(
+                    "{}match {} {{\n",
+                    self.indent(),
+                    self.format_expr(subject)
+                ));
+                self.indent_level += 1;
+                for arm in arms {
+                    let pattern_str = self.format_pattern(&arm.pattern);
+                    self.output.push_str(&format!("{}{} => {{\n", self.indent(), pattern_str));
+                    self.indent_level += 1;
+                    self.format_block_inner(&arm.body);
+                    self.indent_level -= 1;
+                    self.output.push_str(&format!("{}}}\n", self.indent()));
+                }
+                self.indent_level -= 1;
+                self.output.push_str(&format!("{}}}\n", self.indent()));
+                self.emit_inline_comment(span.line);
+            }
         }
     }
 
@@ -413,7 +446,19 @@ impl Formatter {
             | Stmt::For { span, .. }
             | Stmt::Return { span, .. }
             | Stmt::Print { span, .. }
-            | Stmt::Expression { span, .. } => *span,
+            | Stmt::Expression { span, .. }
+            | Stmt::Match { span, .. } => *span,
+        }
+    }
+
+    fn format_pattern(&self, pattern: &Pattern) -> String {
+        match pattern {
+            Pattern::Ok(bind)   => format!("ok({})", bind),
+            Pattern::Err(bind)  => format!("err({})", bind),
+            Pattern::Some(bind) => format!("some({})", bind),
+            Pattern::None       => "none".to_string(),
+            Pattern::Wildcard   => "_".to_string(),
+            Pattern::Ident(name) => name.clone(),
         }
     }
 
@@ -533,6 +578,19 @@ impl Formatter {
 
             Expr::Grouped { expr, .. } => {
                 format!("({})", self.format_expr(expr))
+            }
+
+            Expr::ListLiteral { elements, .. } => {
+                let elems_str = elements
+                    .iter()
+                    .map(|e| self.format_expr(e))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("[{}]", elems_str)
+            }
+
+            Expr::Index { object, index, .. } => {
+                format!("{}[{}]", self.format_expr(object), self.format_expr(index))
             }
 
             Expr::SqlSelect {

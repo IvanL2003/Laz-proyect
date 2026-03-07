@@ -159,6 +159,9 @@ impl Lexer {
                 if self.peek() == '=' {
                     self.advance();
                     TokenKind::EqualEqual
+                } else if self.peek() == '>' {
+                    self.advance();
+                    TokenKind::FatArrow
                 } else {
                     TokenKind::Equal
                 }

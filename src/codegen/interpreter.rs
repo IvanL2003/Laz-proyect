@@ -1,15 +1,4 @@
-// --- Añadir función nativa typeOf ---
-fn native_type_of(args: Vec<Value>) -> Result<Value, RuntimeError> {
-    if args.len() != 1 {
-        return Err(RuntimeError {
-            message: format!("typeOf espera 1 argumento, recibió {}", args.len()),
-            span: Span { line: 0, column: 0, start: 0, end: 0 },
-        });
-    }
-    let type_name = args[0].type_name().to_string();
-    Ok(Value::Str(type_name))
-}
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use crate::lexer::Span;
 use crate::parser::ast::*;
@@ -20,13 +9,17 @@ use crate::utils::csv::DataTable;
 
 // Valores posibles en tiempo de ejecucion.
 // Cada variante corresponde a un tipo del lenguaje:
-//   Int(i64)                             -->  int         ej: 42, -7
-//   Float(f64)                           -->  float       ej: 3.14, 1.0
-//   Bool(bool)                           -->  bool        ej: true, false
-//   Str(String)                          -->  string      ej: "hello"
-//   StructInstance { type_name, fields } -->  NombreStruct  ej: User { name: "Bob", age: 25 }
-//   List(Vec<Value>)                     -->  list<T>     ej: [User{...}, User{...}]
-//   Void                                 -->  void        (retorno de funciones sin valor)
+//   Int(i64)                             -->  int
+//   Float(f64)                           -->  float
+//   Bool(bool)                           -->  bool
+//   Str(String)                          -->  string
+//   StructInstance { type_name, fields } -->  NombreStruct
+//   List(Vec<Value>)                     -->  list<T>
+//   Ok(Box<Value>)                       -->  ok(v)   variante ok de Result<T,E>
+//   Err(Box<Value>)                      -->  err(e)  variante err de Result<T,E>
+//   Some(Box<Value>)                     -->  some(v) variante some de Option<T>
+//   None                                 -->  none    variante none de Option<T>
+//   Void                                 -->  void    (retorno de funciones sin valor)
 #[derive(Debug, Clone)]
 pub enum Value {
     Int(i64),
@@ -34,10 +27,14 @@ pub enum Value {
     Bool(bool),
     Str(String),
     StructInstance {
-        type_name: String,              // nombre del struct ej: "User", "Point"
-        fields: HashMap<String, Value>, // HashMap campo -> valor
+        type_name: String,
+        fields: HashMap<String, Value>,
     },
     List(Vec<Value>),
+    Ok(Box<Value>),
+    Err(Box<Value>),
+    Some(Box<Value>),
+    None,
     Void,
 }
 
@@ -54,6 +51,10 @@ impl Value {
             Value::Str(_) => "string",
             Value::StructInstance { type_name, .. } => type_name,
             Value::List(_) => "list",
+            Value::Ok(_) => "ok",
+            Value::Err(_) => "err",
+            Value::Some(_) => "some",
+            Value::None => "none",
             Value::Void => "void",
         }
     }
@@ -81,7 +82,11 @@ impl Value {
                 let strs: Vec<String> = items.iter().map(|v| v.to_display_string()).collect();
                 format!("[{}]", strs.join(", "))
             }
-            Value::Void => "void".to_string(),
+            Value::Ok(inner)   => format!("ok({})", inner.to_display_string()),
+            Value::Err(inner)  => format!("err({})", inner.to_display_string()),
+            Value::Some(inner) => format!("some({})", inner.to_display_string()),
+            Value::None        => "none".to_string(),
+            Value::Void        => "void".to_string(),
         }
     }
 }
@@ -186,15 +191,31 @@ pub struct Interpreter {
     environment: Environment,
     functions: HashMap<String, FnDecl>,
     structs: HashMap<String, StructDecl>,
-    alias: HashMap<String, String>, // alias -> file path
+    alias: HashMap<String, String>,       // alias -> file path
     base_dir: PathBuf,
     native_functions: HashMap<String, fn(Vec<Value>) -> Result<Value, RuntimeError>>,
+    imported_files: HashSet<PathBuf>,     // para evitar imports circulares
 }
 
 impl Interpreter {
     pub fn new(base_dir: PathBuf) -> Self {
-        let mut native_functions = HashMap::new();
-        native_functions.insert("typeOf".to_string(), native_type_of as fn(Vec<Value>) -> Result<Value, RuntimeError>);
+        let mut native_functions: HashMap<String, fn(Vec<Value>) -> Result<Value, RuntimeError>> = HashMap::new();
+        native_functions.insert("typeOf".to_string(),   native_type_of);
+        native_functions.insert("len".to_string(),      native_len);
+        native_functions.insert("push".to_string(),     native_push);
+        native_functions.insert("pop".to_string(),      native_pop);
+        native_functions.insert("toString".to_string(), native_to_string);
+        native_functions.insert("parseInt".to_string(), native_parse_int);
+        native_functions.insert("toFloat".to_string(),  native_parse_float);
+        native_functions.insert("ok".to_string(),       native_ok);
+        native_functions.insert("err".to_string(),      native_err);
+        native_functions.insert("some".to_string(),     native_some);
+        native_functions.insert("none".to_string(),     native_none);
+        native_functions.insert("unwrap".to_string(),   native_unwrap);
+        native_functions.insert("is_ok".to_string(),    native_is_ok);
+        native_functions.insert("is_err".to_string(),   native_is_err);
+        native_functions.insert("is_some".to_string(),  native_is_some);
+        native_functions.insert("is_none".to_string(),  native_is_none);
         Interpreter {
             environment: Environment::new(),
             functions: HashMap::new(),
@@ -202,11 +223,12 @@ impl Interpreter {
             alias: HashMap::new(),
             base_dir,
             native_functions,
+            imported_files: HashSet::new(),
         }
     }
 
     pub fn run(&mut self, program: &Program) -> Result<(), RuntimeError> {
-        // Register all functions, structs, and file connections
+        // Register all functions, structs, file connections, and process imports
         for decl in &program.declarations {
             match decl {
                 Declaration::Function(f) => {
@@ -217,6 +239,9 @@ impl Interpreter {
                 }
                 Declaration::Connect(c) => {
                     self.alias.insert(c.alias.clone(), c.file_path.clone());
+                }
+                Declaration::Import { path, span } => {
+                    self.process_import(path, *span)?;
                 }
                 Declaration::Statement(_) => {}
             }
@@ -233,6 +258,51 @@ impl Interpreter {
         if self.functions.contains_key("main") {
             let dummy_span = Span { line: 0, column: 0, start: 0, end: 0 };
             self.call_function("main", vec![], dummy_span)?;
+        }
+
+        Ok(())
+    }
+
+    fn process_import(&mut self, path: &str, span: Span) -> Result<(), RuntimeError> {
+        use crate::lexer::Lexer;
+        use crate::parser::Parser;
+
+        let full_path = self.base_dir.join(path);
+        let canonical = full_path.canonicalize().unwrap_or(full_path.clone());
+
+        // Evitar imports circulares
+        if self.imported_files.contains(&canonical) {
+            return Ok(()); // ya importado, no hacer nada
+        }
+        self.imported_files.insert(canonical.clone());
+
+        let source = std::fs::read_to_string(&full_path).map_err(|e| RuntimeError {
+            message: format!("cannot import '{}': {}", path, e),
+            span,
+        })?;
+
+        let tokens = Lexer::new(&source).tokenize().map_err(|e| RuntimeError {
+            message: format!("import '{}' lexer error: {}", path, e.message),
+            span,
+        })?;
+
+        let program = Parser::new(tokens).parse().map_err(|e| RuntimeError {
+            message: format!("import '{}' parse error: {}", path, e.message),
+            span,
+        })?;
+
+        // Solo registrar funciones, structs y connects — no ejecutar statements
+        for decl in &program.declarations {
+            match decl {
+                Declaration::Function(f) => { self.functions.insert(f.name.clone(), f.clone()); }
+                Declaration::Struct(s)   => { self.structs.insert(s.name.clone(), s.clone()); }
+                Declaration::Connect(c)  => { self.alias.insert(c.alias.clone(), c.file_path.clone()); }
+                Declaration::Import { path: inner_path, span: inner_span } => {
+                    // imports transitivos
+                    self.process_import(inner_path, *inner_span)?;
+                }
+                Declaration::Statement(_) => {}
+            }
         }
 
         Ok(())
@@ -257,24 +327,12 @@ impl Interpreter {
 
     fn execute_stmt(&mut self, stmt: &Stmt) -> Result<StmtResult, RuntimeError> {
         match stmt {
-            // let x: int = 42;           mutable=false, type_ann=Some(Int)
-            // let mut count = 0;         mutable=true,  type_ann=None (inferido)
-            // let data = #SELECT * ...;  initializer=SqlSelect (caso especial: mode string/struct)
-            // Si type_ann es None no se verifica compatibilidad de tipos
+            // let x: int = 42;   mutable=false, type_ann=Some(Int)
+            // let mut count = 0;  mutable=true,  type_ann=None (inferido)
+            // El inicializador es siempre una expresion que se evalua normalmente.
+            // Si hay type_ann, se verifica compatibilidad DESPUES de evaluar.
             Stmt::Let { name, mutable, type_ann, initializer, span } => {
-                let value = match initializer {
-                    // Inicializador SQL: determina use_string_mode segun el tipo anotado
-                    // list<list<string>> o list<primitivo> --> string mode (todo como strings)
-                    // list<Struct> o sin tipo --> struct mode (convierte a StructInstance)
-                    Expr::SqlSelect { columns, table_ref, condition, single, span: sql_span } => {
-                        let use_string_mode = type_ann.as_ref()
-                            .map(|t| Self::is_primitive_list_type(t))
-                            .unwrap_or(false);
-                        self.execute_sql_select(columns, table_ref, condition.as_deref(), *single, *sql_span, use_string_mode)?
-                    }
-                    // Cualquier otra expresion: se evalua normalmente
-                    _ => self.evaluate_expr(initializer)?,
-                };
+                let value = self.evaluate_expr(initializer)?;
                 if let Some(ta) = type_ann {
                     self.check_type_compat(&value, ta, *span)?;
                 }
@@ -292,6 +350,35 @@ impl Interpreter {
                     AssignTarget::Variable(name) => {
                         self.environment.set(name, val, *span)?;
                     }
+                    // arr[i] = val — muta el elemento i de la lista
+                    AssignTarget::Index { object: var_name, index } => {
+                        let idx_val = self.evaluate_expr(index)?;
+                        let idx = match idx_val {
+                            Value::Int(i) => i,
+                            _ => return Err(RuntimeError {
+                                message: "list index must be an integer".to_string(),
+                                span: *span,
+                            }),
+                        };
+                        let mut list_val = self.environment.get(var_name, *span)?;
+                        if let Value::List(ref mut items) = list_val {
+                            let len = items.len() as i64;
+                            if idx < 0 || idx >= len {
+                                return Err(RuntimeError {
+                                    message: format!("index {} out of bounds (len={})", idx, len),
+                                    span: *span,
+                                });
+                            }
+                            items[idx as usize] = val;
+                        } else {
+                            return Err(RuntimeError {
+                                message: format!("'{}' is not a list", var_name),
+                                span: *span,
+                            });
+                        }
+                        self.environment.set(var_name, list_val, *span)?;
+                    }
+
                     // Reasignacion de campo de struct (solo un nivel de profundidad)
                     AssignTarget::FieldAccess { object, field } => {
                         // We need to get the struct, modify the field, and set it back
@@ -437,6 +524,50 @@ impl Interpreter {
                 self.evaluate_expr(expr)?;
                 Ok(StmtResult::Normal)
             }
+
+            // match expr { pattern => { body } ... }
+            // Evalua subject, recorre arms hasta el primer pattern que coincida,
+            // ejecuta su body en un scope que incluye las variables bindeadas por el pattern.
+            Stmt::Match { subject, arms, span } => {
+                let val = self.evaluate_expr(subject)?;
+                for arm in arms {
+                    if let Some(bindings) = self.match_pattern(&arm.pattern, &val) {
+                        self.environment.push_scope();
+                        for (name, bound_val) in bindings {
+                            self.environment.define(name, bound_val, false);
+                        }
+                        let result = self.execute_block_inner(&arm.body);
+                        self.environment.pop_scope();
+                        return result;
+                    }
+                }
+                // Ningun pattern coincidio (sin wildcard/_ al final)
+                Err(RuntimeError {
+                    message: format!("non-exhaustive match: no arm matched value '{}'", val.to_display_string()),
+                    span: *span,
+                })
+            }
+        }
+    }
+
+    // Intenta hacer match de un valor contra un patron.
+    // Devuelve Some(bindings) si coincide (lista de (nombre, valor) a bindear en el scope),
+    // o None si no coincide.
+    fn match_pattern(&self, pattern: &Pattern, value: &Value) -> Option<Vec<(String, Value)>> {
+        match (pattern, value) {
+            (Pattern::Ok(bind), Value::Ok(inner)) => {
+                Some(vec![(bind.clone(), *inner.clone())])
+            }
+            (Pattern::Err(bind), Value::Err(inner)) => {
+                Some(vec![(bind.clone(), *inner.clone())])
+            }
+            (Pattern::Some(bind), Value::Some(inner)) => {
+                Some(vec![(bind.clone(), *inner.clone())])
+            }
+            (Pattern::None, Value::None) => Some(vec![]),
+            (Pattern::Wildcard, _) => Some(vec![]),
+            (Pattern::Ident(name), v) => Some(vec![(name.clone(), v.clone())]),
+            _ => None,
         }
     }
 
@@ -458,6 +589,47 @@ impl Interpreter {
 
             // (expr)  -->  simplemente evalua la expresion interior, el agrupamiento no cambia el valor
             Expr::Grouped { expr, .. } => self.evaluate_expr(expr),
+
+            // [e1, e2, e3]  -->  evalua cada elemento y construye Value::List
+            // []            -->  Value::List(vec![])
+            Expr::ListLiteral { elements, .. } => {
+                let values = elements
+                    .iter()
+                    .map(|e| self.evaluate_expr(e))
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(Value::List(values))
+            }
+
+            // objeto[indice]  -->  accede al elemento indice de la lista
+            // indice debe ser int; error si fuera de rango
+            Expr::Index { object, index, span } => {
+                let obj_val = self.evaluate_expr(object)?;
+                let idx_val = self.evaluate_expr(index)?;
+                let idx = match idx_val {
+                    Value::Int(i) => i,
+                    _ => return Err(RuntimeError {
+                        message: "list index must be an integer".to_string(),
+                        span: *span,
+                    }),
+                };
+                match obj_val {
+                    Value::List(items) => {
+                        let len = items.len() as i64;
+                        if idx < 0 || idx >= len {
+                            Err(RuntimeError {
+                                message: format!("index {} out of bounds (len={})", idx, len),
+                                span: *span,
+                            })
+                        } else {
+                            Ok(items[idx as usize].clone())
+                        }
+                    }
+                    other => Err(RuntimeError {
+                        message: format!("cannot index into '{}'", other.type_name()),
+                        span: *span,
+                    }),
+                }
+            }
 
             // Operadores unarios:
             //   UnaryOp::Neg --> -x  (int o float; error si otro tipo)
@@ -592,10 +764,9 @@ impl Interpreter {
             }
 
             // #SELECT cols FROM tabla WHERE cond
-            // Cuando aparece en una expresion (no en let), siempre usa struct mode (use_string_mode=false)
-            // Para string mode, el Stmt::Let lo llama directamente con use_string_mode=true
+            // Devuelve List<StructInstance> (o un StructInstance si es SINGLE).
             Expr::SqlSelect { columns, table_ref, condition, single, span } => {
-                self.execute_sql_select(columns, table_ref, condition.as_deref(), *single, *span, false)
+                self.execute_sql_select(columns, table_ref, condition.as_deref(), *single, *span)
             }
 
             // #INSERT INTO tabla VALUES (expr1, expr2, ...)
@@ -675,28 +846,6 @@ impl Interpreter {
     }
 
     /// Convert a row to a list of string values (for list<list<string>> mode)
-    fn row_to_string_list(headers: &[String], row: &[String], columns: &[String]) -> Value {
-        let use_all = columns.len() == 1 && columns[0] == "*";
-        let values: Vec<Value> = if use_all {
-            row.iter().map(|s| Value::Str(s.clone())).collect()
-        } else {
-            columns.iter().filter_map(|col| {
-                headers.iter().position(|h| h == col)
-                    .map(|i| Value::Str(row[i].clone()))
-            }).collect()
-        };
-        Value::List(values)
-    }
-
-    /// Check if type_ann is a primitive list type (not struct-based)
-    fn is_primitive_list_type(type_ann: &TypeAnnotation) -> bool {
-        matches!(type_ann,
-            TypeAnnotation::List(inner) if matches!(inner.as_ref(),
-                TypeAnnotation::List(_) | TypeAnnotation::StringType | TypeAnnotation::Int | TypeAnnotation::Float | TypeAnnotation::Bool
-            )
-        )
-    }
-
     /// Find a declared struct whose fields match the given table headers
     fn find_matching_struct(&self, headers: &[String], columns: &[String]) -> Option<String> {
         let use_all = columns.len() == 1 && columns[0] == "*";
@@ -734,7 +883,6 @@ impl Interpreter {
         condition: Option<&Expr>,
         single: bool,
         span: Span,
-        use_string_mode: bool,
     ) -> Result<Value, RuntimeError> {
         let (file_path, table_name) = self.resolve_file_path(table_ref, span)?;
         let table = DataTable::from_file(&file_path).map_err(|e| RuntimeError {
@@ -755,19 +903,15 @@ impl Interpreter {
             }
         }
 
-        // Determine the struct type name (only needed in struct mode)
-        let struct_name = if !use_string_mode {
-            self.find_matching_struct(&table.headers, columns)
-                .unwrap_or_else(|| table_name.clone())
-        } else {
-            String::new()
-        };
+        // Busca un struct declarado cuyo fields coincidan con las columnas seleccionadas
+        let struct_name = self.find_matching_struct(&table.headers, columns)
+            .unwrap_or_else(|| table_name.clone());
 
         let mut results = Vec::new();
 
         for row_idx in 0..table.rows.len() {
             let matches = if let Some(cond) = condition {
-                // Push a scope with column values as variables
+                // Scope temporal con los valores de la fila como variables para evaluar WHERE
                 self.environment.push_scope();
                 for (i, header) in table.headers.iter().enumerate() {
                     let val = Self::cell_to_value(&table.rows[row_idx][i]);
@@ -784,15 +928,11 @@ impl Interpreter {
                     }),
                 }
             } else {
-                true // No WHERE = all rows match
+                true // No WHERE = todas las filas coinciden
             };
 
             if matches {
-                let row_value = if use_string_mode {
-                    Self::row_to_string_list(&table.headers, &table.rows[row_idx], columns)
-                } else {
-                    Self::row_to_struct(&struct_name, &table.headers, &table.rows[row_idx], columns)
-                };
+                let row_value = Self::row_to_struct(&struct_name, &table.headers, &table.rows[row_idx], columns);
                 if single {
                     return Ok(row_value);
                 }
@@ -1024,7 +1164,439 @@ impl Interpreter {
             TypeAnnotation::StringType => "string".to_string(),
             TypeAnnotation::Void => "void".to_string(),
             TypeAnnotation::List(inner) => format!("list<{}>", Self::type_ann_name(inner)),
+            TypeAnnotation::Result(ok_t, err_t) => {
+                format!("Result<{}, {}>", Self::type_ann_name(ok_t), Self::type_ann_name(err_t))
+            }
+            TypeAnnotation::Option(inner) => format!("Option<{}>", Self::type_ann_name(inner)),
             TypeAnnotation::UserDefined(name) => name.clone(),
         }
+    }
+}
+
+// ─── Native built-in functions ────────────────────────────────────────────────
+
+fn native_err_arg(name: &str, expected: usize, got: usize) -> RuntimeError {
+    RuntimeError {
+        message: format!("'{}' expects {} argument(s), got {}", name, expected, got),
+        span: Span { line: 0, column: 0, start: 0, end: 0 },
+    }
+}
+
+fn native_type_of(args: Vec<Value>) -> Result<Value, RuntimeError> {
+    if args.len() != 1 { return Err(native_err_arg("typeOf", 1, args.len())); }
+    Ok(Value::Str(args[0].type_name().to_string()))
+}
+
+fn native_len(args: Vec<Value>) -> Result<Value, RuntimeError> {
+    if args.len() != 1 { return Err(native_err_arg("len", 1, args.len())); }
+    match &args[0] {
+        Value::List(items) => Ok(Value::Int(items.len() as i64)),
+        Value::Str(s)      => Ok(Value::Int(s.chars().count() as i64)),
+        other => Err(RuntimeError {
+            message: format!("'len' expects a list or string, got '{}'", other.type_name()),
+            span: Span { line: 0, column: 0, start: 0, end: 0 },
+        }),
+    }
+}
+
+fn native_push(mut args: Vec<Value>) -> Result<Value, RuntimeError> {
+    if args.len() != 2 { return Err(native_err_arg("push", 2, args.len())); }
+    let elem = args.pop().unwrap();
+    let list = args.pop().unwrap();
+    match list {
+        Value::List(mut items) => {
+            items.push(elem);
+            Ok(Value::List(items))
+        }
+        other => Err(RuntimeError {
+            message: format!("'push' expects a list as first argument, got '{}'", other.type_name()),
+            span: Span { line: 0, column: 0, start: 0, end: 0 },
+        }),
+    }
+}
+
+fn native_pop(args: Vec<Value>) -> Result<Value, RuntimeError> {
+    if args.len() != 1 { return Err(native_err_arg("pop", 1, args.len())); }
+    match &args[0] {
+        Value::List(items) => {
+            if items.is_empty() {
+                return Err(RuntimeError {
+                    message: "'pop' called on empty list".to_string(),
+                    span: Span { line: 0, column: 0, start: 0, end: 0 },
+                });
+            }
+            let mut new_items = items.clone();
+            new_items.pop();
+            Ok(Value::List(new_items))
+        }
+        other => Err(RuntimeError {
+            message: format!("'pop' expects a list, got '{}'", other.type_name()),
+            span: Span { line: 0, column: 0, start: 0, end: 0 },
+        }),
+    }
+}
+
+fn native_to_string(args: Vec<Value>) -> Result<Value, RuntimeError> {
+    if args.len() != 1 { return Err(native_err_arg("toString", 1, args.len())); }
+    Ok(Value::Str(args[0].to_display_string()))
+}
+
+fn native_parse_int(args: Vec<Value>) -> Result<Value, RuntimeError> {
+    if args.len() != 1 { return Err(native_err_arg("parseInt", 1, args.len())); }
+    match &args[0] {
+        Value::Str(s) => s.trim().parse::<i64>()
+            .map(Value::Int)
+            .map_err(|_| RuntimeError {
+                message: format!("'parseInt' cannot parse '{}' as int", s),
+                span: Span { line: 0, column: 0, start: 0, end: 0 },
+            }),
+        Value::Int(i) => Ok(Value::Int(*i)),
+        other => Err(RuntimeError {
+            message: format!("'parseInt' expects a string, got '{}'", other.type_name()),
+            span: Span { line: 0, column: 0, start: 0, end: 0 },
+        }),
+    }
+}
+
+fn native_parse_float(args: Vec<Value>) -> Result<Value, RuntimeError> {
+    if args.len() != 1 { return Err(native_err_arg("toFloat", 1, args.len())); }
+    match &args[0] {
+        Value::Str(s) => s.trim().parse::<f64>()
+            .map(Value::Float)
+            .map_err(|_| RuntimeError {
+                message: format!("'toFloat' cannot parse '{}' as float", s),
+                span: Span { line: 0, column: 0, start: 0, end: 0 },
+            }),
+        Value::Float(f) => Ok(Value::Float(*f)),
+        Value::Int(i)   => Ok(Value::Float(*i as f64)),
+        other => Err(RuntimeError {
+            message: format!("'toFloat' expects a string, got '{}'", other.type_name()),
+            span: Span { line: 0, column: 0, start: 0, end: 0 },
+        }),
+    }
+}
+
+fn native_ok(args: Vec<Value>) -> Result<Value, RuntimeError> {
+    if args.len() != 1 { return Err(native_err_arg("ok", 1, args.len())); }
+    Ok(Value::Ok(Box::new(args.into_iter().next().unwrap())))
+}
+
+fn native_err(args: Vec<Value>) -> Result<Value, RuntimeError> {
+    if args.len() != 1 { return Err(native_err_arg("err", 1, args.len())); }
+    Ok(Value::Err(Box::new(args.into_iter().next().unwrap())))
+}
+
+fn native_some(args: Vec<Value>) -> Result<Value, RuntimeError> {
+    if args.len() != 1 { return Err(native_err_arg("some", 1, args.len())); }
+    Ok(Value::Some(Box::new(args.into_iter().next().unwrap())))
+}
+
+fn native_none(args: Vec<Value>) -> Result<Value, RuntimeError> {
+    if !args.is_empty() { return Err(native_err_arg("none", 0, args.len())); }
+    Ok(Value::None)
+}
+
+fn native_unwrap(args: Vec<Value>) -> Result<Value, RuntimeError> {
+    if args.len() != 1 { return Err(native_err_arg("unwrap", 1, args.len())); }
+    match args.into_iter().next().unwrap() {
+        Value::Ok(inner) | Value::Some(inner) => Ok(*inner),
+        Value::Err(e) => Err(RuntimeError {
+            message: format!("unwrap called on err({})", e.to_display_string()),
+            span: Span { line: 0, column: 0, start: 0, end: 0 },
+        }),
+        Value::None => Err(RuntimeError {
+            message: "unwrap called on none".to_string(),
+            span: Span { line: 0, column: 0, start: 0, end: 0 },
+        }),
+        other => Err(RuntimeError {
+            message: format!("'unwrap' expects Result or Option, got '{}'", other.type_name()),
+            span: Span { line: 0, column: 0, start: 0, end: 0 },
+        }),
+    }
+}
+
+fn native_is_ok(args: Vec<Value>) -> Result<Value, RuntimeError> {
+    if args.len() != 1 { return Err(native_err_arg("is_ok", 1, args.len())); }
+    Ok(Value::Bool(matches!(args[0], Value::Ok(_))))
+}
+
+fn native_is_err(args: Vec<Value>) -> Result<Value, RuntimeError> {
+    if args.len() != 1 { return Err(native_err_arg("is_err", 1, args.len())); }
+    Ok(Value::Bool(matches!(args[0], Value::Err(_))))
+}
+
+fn native_is_some(args: Vec<Value>) -> Result<Value, RuntimeError> {
+    if args.len() != 1 { return Err(native_err_arg("is_some", 1, args.len())); }
+    Ok(Value::Bool(matches!(args[0], Value::Some(_))))
+}
+
+fn native_is_none(args: Vec<Value>) -> Result<Value, RuntimeError> {
+    if args.len() != 1 { return Err(native_err_arg("is_none", 1, args.len())); }
+    Ok(Value::Bool(matches!(args[0], Value::None)))
+}
+
+// ─── Integration tests ────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod integration_tests {
+    use super::*;
+    use crate::lexer::Lexer;
+    use crate::parser::Parser;
+    use crate::semantic::TypeChecker;
+
+    fn run_ok(src: &str) -> Interpreter {
+        let tokens = Lexer::new(src).tokenize().expect("lex failed");
+        let program = Parser::new(tokens).parse().expect("parse failed");
+        TypeChecker::check(&program).expect("type check failed");
+        let mut interp = Interpreter::new(PathBuf::from("."));
+        interp.run(&program).expect("runtime failed");
+        interp
+    }
+
+    fn run_err(src: &str) -> RuntimeError {
+        let tokens = Lexer::new(src).tokenize().expect("lex failed");
+        let program = Parser::new(tokens).parse().expect("parse failed");
+        // type check may pass (runtime error only)
+        let _ = TypeChecker::check(&program);
+        let mut interp = Interpreter::new(PathBuf::from("."));
+        interp.run(&program).expect_err("expected runtime error")
+    }
+
+    fn get(interp: &Interpreter, name: &str) -> Value {
+        let span = Span { line: 0, column: 0, start: 0, end: 0 };
+        interp.environment.get(name, span).unwrap()
+    }
+
+    // ── Listas ───────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_list_empty() {
+        let i = run_ok("let result = [];");
+        assert!(matches!(get(&i, "result"), Value::List(ref v) if v.is_empty()));
+    }
+
+    #[test]
+    fn test_list_literal() {
+        let i = run_ok("let result = [1, 2, 3];");
+        if let Value::List(items) = get(&i, "result") {
+            assert_eq!(items.len(), 3);
+            assert!(matches!(items[0], Value::Int(1)));
+            assert!(matches!(items[2], Value::Int(3)));
+        } else { panic!("expected list"); }
+    }
+
+    #[test]
+    fn test_list_index_read() {
+        let i = run_ok("let arr = [10, 20, 30]; let result = arr[1];");
+        assert!(matches!(get(&i, "result"), Value::Int(20)));
+    }
+
+    #[test]
+    fn test_list_index_write() {
+        let i = run_ok("let mut arr = [1, 2, 3]; arr[0] = 99; let result = arr[0];");
+        assert!(matches!(get(&i, "result"), Value::Int(99)));
+    }
+
+    #[test]
+    fn test_list_out_of_bounds() {
+        run_err("let arr = [1, 2]; let x = arr[5];");
+    }
+
+    // ── Built-ins: len, push, pop ─────────────────────────────────────────────
+
+    #[test]
+    fn test_len_list() {
+        let i = run_ok("let result = len([1, 2, 3]);");
+        assert!(matches!(get(&i, "result"), Value::Int(3)));
+    }
+
+    #[test]
+    fn test_len_string() {
+        let i = run_ok("let result = len(\"hello\");");
+        assert!(matches!(get(&i, "result"), Value::Int(5)));
+    }
+
+    #[test]
+    fn test_push() {
+        let i = run_ok("let result = push([1, 2], 3);");
+        if let Value::List(items) = get(&i, "result") {
+            assert_eq!(items.len(), 3);
+            assert!(matches!(items[2], Value::Int(3)));
+        } else { panic!("expected list"); }
+    }
+
+    #[test]
+    fn test_pop() {
+        let i = run_ok("let result = pop([1, 2, 3]);");
+        if let Value::List(items) = get(&i, "result") {
+            assert_eq!(items.len(), 2);
+        } else { panic!("expected list"); }
+    }
+
+    // ── Built-ins: toString, parseInt, toFloat ────────────────────────────────
+
+    #[test]
+    fn test_to_string() {
+        let i = run_ok("let result = toString(42);");
+        assert!(matches!(get(&i, "result"), Value::Str(ref s) if s == "42"));
+    }
+
+    #[test]
+    fn test_parse_int() {
+        let i = run_ok("let result = parseInt(\"42\");");
+        assert!(matches!(get(&i, "result"), Value::Int(42)));
+    }
+
+    #[test]
+    fn test_to_float() {
+        let i = run_ok("let result = toFloat(\"3.14\");");
+        if let Value::Float(f) = get(&i, "result") {
+            assert!((f - 3.14).abs() < 1e-9);
+        } else { panic!("expected float"); }
+    }
+
+    #[test]
+    fn test_to_float_from_int() {
+        let i = run_ok("let result = toFloat(5);");
+        assert!(matches!(get(&i, "result"), Value::Float(f) if (f - 5.0).abs() < 1e-9));
+    }
+
+    // ── Result: ok, err ───────────────────────────────────────────────────────
+
+    #[test]
+    fn test_ok_constructor() {
+        let i = run_ok("let result = ok(42);");
+        assert!(matches!(get(&i, "result"), Value::Ok(_)));
+    }
+
+    #[test]
+    fn test_err_constructor() {
+        let i = run_ok("let result = err(\"oops\");");
+        assert!(matches!(get(&i, "result"), Value::Err(_)));
+    }
+
+    #[test]
+    fn test_is_ok_true() {
+        let i = run_ok("let result = is_ok(ok(1));");
+        assert!(matches!(get(&i, "result"), Value::Bool(true)));
+    }
+
+    #[test]
+    fn test_is_ok_false() {
+        let i = run_ok("let result = is_ok(err(\"x\"));");
+        assert!(matches!(get(&i, "result"), Value::Bool(false)));
+    }
+
+    #[test]
+    fn test_is_err_true() {
+        let i = run_ok("let result = is_err(err(\"fail\"));");
+        assert!(matches!(get(&i, "result"), Value::Bool(true)));
+    }
+
+    #[test]
+    fn test_unwrap_ok() {
+        let i = run_ok("let result = unwrap(ok(99));");
+        assert!(matches!(get(&i, "result"), Value::Int(99)));
+    }
+
+    #[test]
+    fn test_unwrap_err_panics() {
+        run_err("let x = unwrap(err(\"oops\"));");
+    }
+
+    // ── Option: some, none ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_some_constructor() {
+        let i = run_ok("let result = some(5);");
+        assert!(matches!(get(&i, "result"), Value::Some(_)));
+    }
+
+    #[test]
+    fn test_none_constructor() {
+        let i = run_ok("let result = none();");
+        assert!(matches!(get(&i, "result"), Value::None));
+    }
+
+    #[test]
+    fn test_is_some_true() {
+        let i = run_ok("let result = is_some(some(1));");
+        assert!(matches!(get(&i, "result"), Value::Bool(true)));
+    }
+
+    #[test]
+    fn test_is_none_true() {
+        let i = run_ok("let result = is_none(none());");
+        assert!(matches!(get(&i, "result"), Value::Bool(true)));
+    }
+
+    #[test]
+    fn test_unwrap_some() {
+        let i = run_ok("let result = unwrap(some(7));");
+        assert!(matches!(get(&i, "result"), Value::Int(7)));
+    }
+
+    #[test]
+    fn test_unwrap_none_panics() {
+        run_err("let x = unwrap(none());");
+    }
+
+    // ── match statement ───────────────────────────────────────────────────────
+
+    #[test]
+    fn test_match_ok_arm() {
+        let i = run_ok("let mut result = 0; match ok(42) { ok(v) => { result = v; } err(e) => { result = -1; } }");
+        assert!(matches!(get(&i, "result"), Value::Int(42)));
+    }
+
+    #[test]
+    fn test_match_err_arm() {
+        let i = run_ok("let mut result = 0; match err(\"fail\") { ok(v) => { result = 1; } err(e) => { result = -1; } }");
+        assert!(matches!(get(&i, "result"), Value::Int(-1)));
+    }
+
+    #[test]
+    fn test_match_some_arm() {
+        let i = run_ok("let mut result = 0; match some(99) { some(x) => { result = x; } none => { result = -1; } }");
+        assert!(matches!(get(&i, "result"), Value::Int(99)));
+    }
+
+    #[test]
+    fn test_match_none_arm() {
+        let i = run_ok("let mut result = 0; match none() { some(x) => { result = x; } none => { result = -2; } }");
+        assert!(matches!(get(&i, "result"), Value::Int(-2)));
+    }
+
+    #[test]
+    fn test_match_wildcard() {
+        let i = run_ok("let mut result = 0; match ok(5) { _ => { result = 99; } }");
+        assert!(matches!(get(&i, "result"), Value::Int(99)));
+    }
+
+    #[test]
+    fn test_match_no_arm_error() {
+        run_err("match ok(1) { err(e) => { } }");
+    }
+
+    // ── Integración con funciones y control de flujo ──────────────────────────
+
+    #[test]
+    fn test_function_with_list() {
+        let src = "fn first(n: int) -> int { let arr = [10, 20, 30]; return arr[0]; } let result = first(0);";
+        let i = run_ok(src);
+        assert!(matches!(get(&i, "result"), Value::Int(10)));
+    }
+
+    #[test]
+    fn test_push_in_loop() {
+        let src = r#"
+let mut arr = [];
+for i in 0..3 {
+    arr = push(arr, i);
+}
+let result = len(arr);
+        "#;
+        let i = run_ok(src);
+        assert!(matches!(get(&i, "result"), Value::Int(3)));
     }
 }

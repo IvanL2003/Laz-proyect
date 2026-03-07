@@ -46,6 +46,8 @@ pub enum TokenKind {
     Db,
     Api,
     As,
+    Match,
+    Import,
 
     // Type keywords
     IntType,
@@ -87,7 +89,8 @@ pub enum TokenKind {
     Dot,
     Semicolon,
     Colon,
-    Arrow,
+    Arrow,    // ->
+    FatArrow, // =>
     DotDot,
 
     // Brackets
@@ -134,6 +137,8 @@ impl std::fmt::Display for TokenKind {
             TokenKind::Db => write!(f, "db"),
             TokenKind::Api => write!(f, "api"),
             TokenKind::As => write!(f, "as"),
+            TokenKind::Match => write!(f, "match"),
+            TokenKind::Import => write!(f, "import"),
             TokenKind::IntType => write!(f, "int"),
             TokenKind::FloatType => write!(f, "float"),
             TokenKind::BoolType => write!(f, "bool"),
@@ -164,6 +169,7 @@ impl std::fmt::Display for TokenKind {
             TokenKind::Semicolon => write!(f, ";"),
             TokenKind::Colon => write!(f, ":"),
             TokenKind::Arrow => write!(f, "->"),
+            TokenKind::FatArrow => write!(f, "=>"),
             TokenKind::DotDot => write!(f, ".."),
             TokenKind::LeftBracket => write!(f, "["),
             TokenKind::RightBracket => write!(f, "]"),
@@ -204,6 +210,8 @@ pub fn lookup_keyword(ident: &str) -> Option<TokenKind> {
         "connect" => Some(TokenKind::Connect),
         "file" => Some(TokenKind::File),
         "as" => Some(TokenKind::As),
+        "match" => Some(TokenKind::Match),
+        "import" => Some(TokenKind::Import),
         "true" => Some(TokenKind::BoolLiteral(true)),
         "false" => Some(TokenKind::BoolLiteral(false)),
         "int" => Some(TokenKind::IntType),
