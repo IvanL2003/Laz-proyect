@@ -842,7 +842,54 @@ impl Interpreter {
                     Value::List(items) => {
                         for item in items {
                             self.environment.push_scope();
-                            self.environment.define(variable[0].clone(), item, false);
+
+                            if variable.len() == 1 {
+                                // for item in list { }  — variable única
+                                self.environment.define(variable[0].clone(), item, false);
+                            } else {
+                                // for (n, a, c) in structs { }  — destructuring posicional
+                                if let Value::StructInstance { ref type_name, ref fields } = item {
+                                    // Lookup del orden de campos en la definición del struct
+                                    if let Some(struct_decl) = self.structs.get(type_name).cloned() {
+                                        let field_names: Vec<String> = struct_decl.fields.iter()
+                                            .map(|f| f.name.clone())
+                                            .collect();
+                                        if variable.len() != field_names.len() {
+                                            self.environment.pop_scope();
+                                            return Err(RuntimeError {
+                                                message: format!(
+                                                    "destructuring mismatch: '{}' has {} field(s) ({}) but {} variable(s) were provided",
+                                                    type_name,
+                                                    field_names.len(),
+                                                    field_names.join(", "),
+                                                    variable.len()
+                                                ),
+                                                span: *span,
+                                            });
+                                        }
+                                        for (var_name, field_name) in variable.iter().zip(field_names.iter()) {
+                                            let val = fields.get(field_name).cloned().unwrap_or(Value::Void);
+                                            self.environment.define(var_name.clone(), val, false);
+                                        }
+                                    } else {
+                                        self.environment.pop_scope();
+                                        return Err(RuntimeError {
+                                            message: format!("unknown struct type '{}' in destructuring", type_name),
+                                            span: *span,
+                                        });
+                                    }
+                                } else {
+                                    self.environment.pop_scope();
+                                    return Err(RuntimeError {
+                                        message: format!(
+                                            "cannot destructure '{}' with multiple variables — only structs support positional destructuring",
+                                            item.type_name()
+                                        ),
+                                        span: *span,
+                                    });
+                                }
+                            }
+
                             let result = self.execute_block_inner(body);
                             self.environment.pop_scope();
                             match result? {
@@ -4192,7 +4239,7 @@ let result = found;
 
     #[test]
     fn test_foreach_dict_two_vars() {
-        // for k, v in dict { }
+        // for k, v in dict { }  (sin paréntesis)
         let src = r#"
 let d = {"n": 42};
 let mut result = 0;
@@ -4202,6 +4249,63 @@ for k, v in d {
 "#;
         let i = run_ok(src);
         assert!(matches!(get(&i, "result"), Value::Int(42)));
+    }
+
+    #[test]
+    fn test_foreach_dict_paren_syntax() {
+        // for (k, v) in dict { }  (con paréntesis — forma canónica)
+        let src = r#"
+let d = {"m": 99};
+let mut result = 0;
+for (k, v) in d {
+    result = v;
+}
+"#;
+        let i = run_ok(src);
+        assert!(matches!(get(&i, "result"), Value::Int(99)));
+    }
+
+    #[test]
+    fn test_foreach_struct_destructuring() {
+        // for (n, a, c) in users { }  — destructuring posicional de structs
+        let src = r#"
+struct User {
+    name: string,
+    age: int,
+    city: string,
+}
+let users = [User { name: "Ana", age: 30, city: "Madrid" }, User { name: "Leo", age: 25, city: "Roma" }];
+let mut total_age = 0;
+let mut last_city = "none";
+for (n, a, c) in users {
+    total_age = total_age + a;
+    last_city = c;
+}
+"#;
+        let i = run_ok(src);
+        assert!(matches!(get(&i, "total_age"), Value::Int(55)));
+        assert!(matches!(get(&i, "last_city"), Value::Str(s) if s == "Roma"));
+    }
+
+    #[test]
+    fn test_foreach_struct_destructuring_mismatch_error() {
+        // Número incorrecto de variables → error
+        let src = r#"
+struct Point {
+    x: int,
+    y: int,
+}
+let pts = [Point { x: 1, y: 2 }];
+for (a, b, c) in pts {
+    print(a);
+}
+"#;
+        let mut lexer = crate::lexer::Lexer::new(src);
+        let tokens = lexer.tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse().unwrap();
+        let mut interp = Interpreter::new(PathBuf::from("."));
+        let result = interp.run(&program);
+        assert!(result.is_err(), "expected error for wrong variable count");
     }
 
     // ── User-defined Enums ────────────────────────────────────────────────────

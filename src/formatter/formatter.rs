@@ -453,7 +453,13 @@ impl Formatter {
             }
 
             Stmt::ForEach { variable, iterable, body, span } => {
-                let vars = variable.join(", ");
+                // 1 variable → `for item in ...`
+                // 2+ variables → `for (k, v) in ...` (forma canónica con paréntesis)
+                let vars = if variable.len() == 1 {
+                    variable[0].clone()
+                } else {
+                    format!("({})", variable.join(", "))
+                };
                 self.output.push_str(&format!(
                     "{}for {} in {} {{\n",
                     self.indent(),

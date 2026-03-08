@@ -455,16 +455,35 @@ impl Parser {
     fn parse_for_stmt(&mut self) -> Result<Stmt, ParseError> {
         // for i in 1..10 { }            → Stmt::For (range)
         // for item in myList { }         → Stmt::ForEach (collection, 1 var)
-        // for k, v in myDict { }         → Stmt::ForEach (collection, 2 vars)
+        // for (k, v) in myDict { }         → Stmt::ForEach (collection, 2 vars)
+        // for (v1, v2, ...) in myDict { }         → Stmt::ForEach (collection, n vars)
         let for_token = self.advance(); // consume 'for'
 
-        // Parse one or two loop variables
+        // Parse loop variables — dos formas:
+        //   sin paréntesis:  i        →  for i in ...
+        //   sin paréntesis:  k, v     →  for k, v in ...
+        //   con paréntesis:  (k, v)   →  for (k, v) in ...
+        //   con paréntesis:  (a,b,c)  →  for (a, b, c) in ...
         let mut variables = Vec::new();
-        let (first_var, _) = self.expect_ident()?;
-        variables.push(first_var);
-        if self.match_token(&TokenKind::Comma) {
-            let (second_var, _) = self.expect_ident()?;
-            variables.push(second_var);
+
+        if self.match_token(&TokenKind::LeftParen) {
+            // Forma con paréntesis: (var1, var2, ...)
+            loop {
+                let (var, _) = self.expect_ident()?;
+                variables.push(var);
+                if !self.match_token(&TokenKind::Comma) {
+                    break;
+                }
+            }
+            self.expect(&TokenKind::RightParen)?;
+        } else {
+            // Forma sin paréntesis: var  o  var, var
+            let (first_var, _) = self.expect_ident()?;
+            variables.push(first_var);
+            if self.match_token(&TokenKind::Comma) {
+                let (second_var, _) = self.expect_ident()?;
+                variables.push(second_var);
+            }
         }
 
         self.expect(&TokenKind::In)?;
