@@ -96,21 +96,116 @@ impl Parser {
             TokenKind::Struct => Ok(Declaration::Struct(self.parse_struct_decl()?)),
             TokenKind::Enum => Ok(Declaration::Enum(self.parse_enum_decl()?)),
             TokenKind::Connect => Ok(Declaration::Connect(self.parse_connect()?)),
+            TokenKind::Package => {
+                let tok = self.advance(); // consume 'package'
+                let (name, _) = self.expect_ident()?;
+                self.expect(&TokenKind::Semicolon)?;
+                Ok(Declaration::Package { name, span: tok.span })
+            }
             TokenKind::Import => {
-                let import_token = self.advance(); // consume 'import'
-                let path = match self.advance().kind {
-                    TokenKind::StringLiteral(s) => s,
+                let import_span = self.peek().span;
+                let kind = self.parse_import_kind()?;
+                Ok(Declaration::Import { kind, span: import_span })
+            }
+            _ => Ok(Declaration::Statement(self.parse_statement()?)),
+        }
+    }
+
+    /// Parsea todo lo que sigue a `import`:
+    ///   "path.lz"                       → ImportKind::Path
+    ///   "path.lz" as alias              → ImportKind::Path con alias
+    ///   math                            → ImportKind::Named
+    ///   math as m                       → ImportKind::Named con alias
+    ///   { cos, sin } from math          → ImportKind::Selective (Named)
+    ///   { cos, sin } from "math.lz"     → ImportKind::Selective (Path)
+    ///   { cos as coseno } from math     → ImportKind::Selective con rename
+    fn parse_import_kind(&mut self) -> Result<ImportKind, ParseError> {
+        self.advance(); // consume 'import'
+
+        match self.peek_kind().clone() {
+            // import "path.lz"  or  import "path.lz" as alias
+            TokenKind::StringLiteral(path) => {
+                self.advance(); // consume the string
+                let alias = if self.match_token(&TokenKind::As) {
+                    let (name, _) = self.expect_ident()?;
+                    Some(name)
+                } else {
+                    None
+                };
+                self.expect(&TokenKind::Semicolon)?;
+                Ok(ImportKind::Path { path, alias })
+            }
+
+            // import { cos, sin } from ...
+            TokenKind::LeftBrace => {
+                self.advance(); // consume '{'
+                let mut items = Vec::new();
+                while !self.check(&TokenKind::RightBrace) && !self.is_at_end() {
+                    let (name, _) = self.expect_ident()?;
+                    let alias = if self.match_token(&TokenKind::As) {
+                        let (a, _) = self.expect_ident()?;
+                        Some(a)
+                    } else {
+                        None
+                    };
+                    items.push(ImportItem { name, alias });
+                    if !self.match_token(&TokenKind::Comma) {
+                        break;
+                    }
+                    // trailing comma before } is fine
+                    if self.check(&TokenKind::RightBrace) { break; }
+                }
+                self.expect(&TokenKind::RightBrace)?;
+                // expect 'from' (lowercase identifier — not a keyword)
+                match self.peek_kind() {
+                    TokenKind::Ident(s) if s == "from" => { self.advance(); }
+                    _ => return Err(ParseError {
+                        message: format!("expected 'from', found '{}'", self.peek_kind()),
+                        expected: "from".to_string(),
+                        found: format!("{}", self.peek_kind()),
+                        span: self.peek().span,
+                    }),
+                }
+                let source = match self.peek_kind().clone() {
+                    TokenKind::StringLiteral(path) => {
+                        self.advance();
+                        ImportSource::Path(path)
+                    }
+                    TokenKind::Ident(pkg) => {
+                        self.advance();
+                        ImportSource::Named(pkg)
+                    }
                     other => return Err(ParseError {
-                        message: format!("expected file path string after 'import', found '{}'", other),
-                        expected: "string literal".to_string(),
+                        message: format!("expected package name or path string after 'from', found '{}'", other),
+                        expected: "identifier or string".to_string(),
                         found: format!("{}", other),
-                        span: import_token.span,
+                        span: self.peek().span,
                     }),
                 };
                 self.expect(&TokenKind::Semicolon)?;
-                Ok(Declaration::Import { path, span: import_token.span })
+                Ok(ImportKind::Selective { source, items })
             }
-            _ => Ok(Declaration::Statement(self.parse_statement()?)),
+
+            // import math;  or  import math as m;
+            TokenKind::Ident(pkg) => {
+                let pkg = pkg.clone();
+                self.advance();
+                let alias = if self.match_token(&TokenKind::As) {
+                    let (name, _) = self.expect_ident()?;
+                    Some(name)
+                } else {
+                    None
+                };
+                self.expect(&TokenKind::Semicolon)?;
+                Ok(ImportKind::Named { package: pkg, alias })
+            }
+
+            other => Err(ParseError {
+                message: format!("expected path, package name, or '{{' after 'import', found '{}'", other),
+                expected: "string, identifier, or '{'".to_string(),
+                found: format!("{}", other),
+                span: self.peek().span,
+            }),
         }
     }
 
@@ -207,9 +302,28 @@ impl Parser {
         })
     }
 
+    /// Parse optional generic type parameter list: `<T>`, `<A, B>`, or nothing.
+    fn parse_type_params(&mut self) -> Result<Vec<String>, ParseError> {
+        if !self.check(&TokenKind::Less) {
+            return Ok(Vec::new());
+        }
+        self.advance(); // consume '<'
+        let mut params = Vec::new();
+        loop {
+            let (param, _) = self.expect_ident()?;
+            params.push(param);
+            if !self.match_token(&TokenKind::Comma) {
+                break;
+            }
+        }
+        self.expect(&TokenKind::Greater)?;
+        Ok(params)
+    }
+
     fn parse_fn_decl(&mut self) -> Result<FnDecl, ParseError> {
         let fn_token = self.advance(); // consume 'fn'
         let (name, _) = self.expect_ident()?;
+        let type_params = self.parse_type_params()?;
         self.expect(&TokenKind::LeftParen)?;
 
         let mut params = Vec::new();
@@ -241,6 +355,7 @@ impl Parser {
 
         Ok(FnDecl {
             name,
+            type_params,
             params,
             return_type,
             body,
@@ -251,6 +366,7 @@ impl Parser {
     fn parse_struct_decl(&mut self) -> Result<StructDecl, ParseError> {
         let struct_token = self.advance(); // consume 'struct'
         let (name, _) = self.expect_ident()?;
+        let type_params = self.parse_type_params()?;
         self.expect(&TokenKind::LeftBrace)?;
 
         let mut fields = Vec::new();
@@ -272,6 +388,7 @@ impl Parser {
 
         Ok(StructDecl {
             name,
+            type_params,
             fields,
             span: struct_token.span,
         })
@@ -343,7 +460,23 @@ impl Parser {
                 self.expect(&TokenKind::Greater)?;
                 Ok(TypeAnnotation::Option(Box::new(inner)))
             }
-            TokenKind::Ident(name) => Ok(TypeAnnotation::UserDefined(name)),
+            TokenKind::Ident(name) => {
+                // Generic instantiation: Pair<int, string>, Stack<User>, etc.
+                if self.check(&TokenKind::Less) {
+                    self.advance(); // consume '<'
+                    let mut type_args = Vec::new();
+                    loop {
+                        type_args.push(self.parse_type()?);
+                        if !self.match_token(&TokenKind::Comma) {
+                            break;
+                        }
+                    }
+                    self.expect(&TokenKind::Greater)?;
+                    Ok(TypeAnnotation::Generic(name, type_args))
+                } else {
+                    Ok(TypeAnnotation::UserDefined(name))
+                }
+            }
             _ => Err(ParseError {
                 message: format!("expected type, found '{}'", token.kind),
                 expected: "type".to_string(),
@@ -374,6 +507,16 @@ impl Parser {
             TokenKind::If => self.parse_if_stmt(),
             TokenKind::While => self.parse_while_stmt(),
             TokenKind::For => self.parse_for_stmt(),
+            TokenKind::Break => {
+                let tok = self.advance();
+                self.expect(&TokenKind::Semicolon)?;
+                Ok(Stmt::Break { span: tok.span })
+            }
+            TokenKind::Continue => {
+                let tok = self.advance();
+                self.expect(&TokenKind::Semicolon)?;
+                Ok(Stmt::Continue { span: tok.span })
+            }
             TokenKind::Return => self.parse_return_stmt(),
             TokenKind::Print => self.parse_print_stmt(),
             TokenKind::Match => self.parse_match_stmt(),
@@ -981,17 +1124,46 @@ impl Parser {
                 let name = name.clone();
                 self.advance();
 
-                // Check for enum variant access: Color::Red
+                // Check for :: — either enum variant (Color::Red) or namespace call (math::fn(args))
                 if self.check(&TokenKind::ColonColon) {
                     self.advance(); // consume '::'
-                    let (variant, _) = self.expect_ident()?;
-                    let span = Span {
+                    let (member, _) = self.expect_ident()?;
+                    let base_span = Span {
                         line: token.span.line,
                         column: token.span.column,
                         start: token.span.start,
-                        end: token.span.end + variant.len() + 2, // approximate
+                        end: token.span.end + member.len() + 2, // approximate
                     };
-                    return Ok(Expr::EnumVariant { enum_name: name, variant, span });
+
+                    // If immediately followed by '(' → namespaced function call: ns::fn(args)
+                    if self.check(&TokenKind::LeftParen) {
+                        self.advance(); // consume '('
+                        let mut args = Vec::new();
+                        if !self.check(&TokenKind::RightParen) {
+                            loop {
+                                args.push(self.parse_expression()?);
+                                if !self.match_token(&TokenKind::Comma) {
+                                    break;
+                                }
+                            }
+                        }
+                        let close = self.expect(&TokenKind::RightParen)?;
+                        let call_span = Span {
+                            line: token.span.line,
+                            column: token.span.column,
+                            start: token.span.start,
+                            end: close.span.end,
+                        };
+                        // Store callee as "namespace::fn_name"
+                        return Ok(Expr::FnCall {
+                            callee: format!("{}::{}", name, member),
+                            args,
+                            span: call_span,
+                        });
+                    }
+
+                    // Otherwise → enum variant: Color::Red
+                    return Ok(Expr::EnumVariant { enum_name: name, variant: member, span: base_span });
                 }
 
                 // Check for struct initialization: Name { field: value, ... }
@@ -1509,5 +1681,224 @@ mod tests {
     fn test_unary_ops() {
         let program = parse("fn main() { let x: int = -5; let y: bool = !true; }");
         assert_eq!(program.declarations.len(), 1);
+    }
+
+    // ── Generics ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_generic_fn_decl_single_param() {
+        let program = parse("fn identity<T>(x: T) -> T { return x; }");
+        match &program.declarations[0] {
+            Declaration::Function(f) => {
+                assert_eq!(f.name, "identity");
+                assert_eq!(f.type_params, vec!["T".to_string()]);
+                assert_eq!(f.params.len(), 1);
+                assert_eq!(f.params[0].name, "x");
+                assert_eq!(f.params[0].type_ann, TypeAnnotation::UserDefined("T".to_string()));
+                assert_eq!(f.return_type, TypeAnnotation::UserDefined("T".to_string()));
+            }
+            _ => panic!("Expected function"),
+        }
+    }
+
+    #[test]
+    fn test_generic_fn_decl_two_params() {
+        let program = parse("fn second<A, B>(a: A, b: B) -> B { return b; }");
+        match &program.declarations[0] {
+            Declaration::Function(f) => {
+                assert_eq!(f.type_params, vec!["A".to_string(), "B".to_string()]);
+                assert_eq!(f.params.len(), 2);
+            }
+            _ => panic!("Expected function"),
+        }
+    }
+
+    #[test]
+    fn test_non_generic_fn_has_empty_type_params() {
+        let program = parse("fn add(a: int, b: int) -> int { return a; }");
+        match &program.declarations[0] {
+            Declaration::Function(f) => {
+                assert!(f.type_params.is_empty());
+            }
+            _ => panic!("Expected function"),
+        }
+    }
+
+    #[test]
+    fn test_generic_struct_decl() {
+        let program = parse("struct Pair<A, B> { first: A, second: B }");
+        match &program.declarations[0] {
+            Declaration::Struct(s) => {
+                assert_eq!(s.name, "Pair");
+                assert_eq!(s.type_params, vec!["A".to_string(), "B".to_string()]);
+                assert_eq!(s.fields.len(), 2);
+                assert_eq!(s.fields[0].type_ann, TypeAnnotation::UserDefined("A".to_string()));
+                assert_eq!(s.fields[1].type_ann, TypeAnnotation::UserDefined("B".to_string()));
+            }
+            _ => panic!("Expected struct"),
+        }
+    }
+
+    // ── Módulos / namespace calls ─────────────────────────────────────────────
+
+    #[test]
+    fn test_import_path_no_alias() {
+        let program = parse("import \"math.lz\";");
+        match &program.declarations[0] {
+            Declaration::Import { kind: ImportKind::Path { path, alias }, .. } => {
+                assert_eq!(path, "math.lz");
+                assert!(alias.is_none());
+            }
+            _ => panic!("Expected Import::Path"),
+        }
+    }
+
+    #[test]
+    fn test_import_path_with_alias() {
+        let program = parse("import \"math.lz\" as math;");
+        match &program.declarations[0] {
+            Declaration::Import { kind: ImportKind::Path { path, alias }, .. } => {
+                assert_eq!(path, "math.lz");
+                assert_eq!(*alias, Some("math".to_string()));
+            }
+            _ => panic!("Expected Import::Path with alias"),
+        }
+    }
+
+    #[test]
+    fn test_import_named_no_alias() {
+        let program = parse("import math;");
+        match &program.declarations[0] {
+            Declaration::Import { kind: ImportKind::Named { package, alias }, .. } => {
+                assert_eq!(package, "math");
+                assert!(alias.is_none());
+            }
+            _ => panic!("Expected Import::Named"),
+        }
+    }
+
+    #[test]
+    fn test_import_named_with_alias() {
+        let program = parse("import math as m;");
+        match &program.declarations[0] {
+            Declaration::Import { kind: ImportKind::Named { package, alias }, .. } => {
+                assert_eq!(package, "math");
+                assert_eq!(*alias, Some("m".to_string()));
+            }
+            _ => panic!("Expected Import::Named with alias"),
+        }
+    }
+
+    #[test]
+    fn test_import_selective_from_named() {
+        let program = parse("import { cos, sin } from math;");
+        match &program.declarations[0] {
+            Declaration::Import { kind: ImportKind::Selective { source, items }, .. } => {
+                assert!(matches!(source, ImportSource::Named(pkg) if pkg == "math"));
+                assert_eq!(items.len(), 2);
+                assert_eq!(items[0].name, "cos");
+                assert_eq!(items[1].name, "sin");
+                assert!(items[0].alias.is_none());
+            }
+            _ => panic!("Expected Import::Selective"),
+        }
+    }
+
+    #[test]
+    fn test_import_selective_from_path() {
+        let program = parse("import { cos } from \"math.lz\";");
+        match &program.declarations[0] {
+            Declaration::Import { kind: ImportKind::Selective { source, items }, .. } => {
+                assert!(matches!(source, ImportSource::Path(p) if p == "math.lz"));
+                assert_eq!(items.len(), 1);
+                assert_eq!(items[0].name, "cos");
+            }
+            _ => panic!("Expected Import::Selective from path"),
+        }
+    }
+
+    #[test]
+    fn test_import_selective_with_rename() {
+        let program = parse("import { cos as coseno } from math;");
+        match &program.declarations[0] {
+            Declaration::Import { kind: ImportKind::Selective { items, .. }, .. } => {
+                assert_eq!(items[0].name, "cos");
+                assert_eq!(items[0].alias, Some("coseno".to_string()));
+            }
+            _ => panic!("Expected Import::Selective with rename"),
+        }
+    }
+
+    #[test]
+    fn test_package_declaration() {
+        let program = parse("package math;");
+        match &program.declarations[0] {
+            Declaration::Package { name, .. } => {
+                assert_eq!(name, "math");
+            }
+            _ => panic!("Expected Package"),
+        }
+    }
+
+    #[test]
+    fn test_namespace_fn_call_parses_as_fn_call() {
+        // math::add(1, 2) should parse as FnCall { callee: "math::add", args: [1, 2] }
+        let program = parse("fn main() { let x: int = math::add(1, 2); }");
+        match &program.declarations[0] {
+            Declaration::Function(f) => {
+                match &f.body.statements[0] {
+                    Stmt::Let { initializer: Expr::FnCall { callee, args, .. }, .. } => {
+                        assert_eq!(callee, "math::add");
+                        assert_eq!(args.len(), 2);
+                    }
+                    _ => panic!("Expected Let with FnCall"),
+                }
+            }
+            _ => panic!("Expected Function"),
+        }
+    }
+
+    #[test]
+    fn test_enum_variant_still_works_after_namespace_change() {
+        // Color::Red (no parens after) must still parse as EnumVariant
+        let program = parse("fn main() { let c = Color::Red; }");
+        match &program.declarations[0] {
+            Declaration::Function(f) => {
+                match &f.body.statements[0] {
+                    Stmt::Let { initializer: Expr::EnumVariant { enum_name, variant, .. }, .. } => {
+                        assert_eq!(enum_name, "Color");
+                        assert_eq!(variant, "Red");
+                    }
+                    _ => panic!("Expected Let with EnumVariant"),
+                }
+            }
+            _ => panic!("Expected Function"),
+        }
+    }
+
+    #[test]
+    fn test_generic_type_annotation_in_let() {
+        // Pair<int, string> should parse as TypeAnnotation::Generic
+        let program = parse(r#"
+struct Pair<A, B> { first: A, second: B }
+fn main() { let p: Pair<int, string> = Pair { first: 1, second: "x" }; }
+"#);
+        match &program.declarations[1] {
+            Declaration::Function(f) => {
+                match &f.body.statements[0] {
+                    Stmt::Let { type_ann, .. } => {
+                        assert_eq!(
+                            *type_ann,
+                            Some(TypeAnnotation::Generic(
+                                "Pair".to_string(),
+                                vec![TypeAnnotation::Int, TypeAnnotation::StringType]
+                            ))
+                        );
+                    }
+                    _ => panic!("Expected Let"),
+                }
+            }
+            _ => panic!("Expected function"),
+        }
     }
 }

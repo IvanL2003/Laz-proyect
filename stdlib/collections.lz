@@ -1,0 +1,160 @@
+package collections;
+
+// ── Aggregation ───────────────────────────────────────────────────────────────
+
+// Sum of all integers in a list.
+fn sum(nums: list<int>) -> int {
+    let mut total = 0;
+    for i in 0..len(nums) {
+        total = total + nums[i];
+    }
+    return total;
+}
+
+// Sum of all floats in a list.
+fn sumf(nums: list<float>) -> float {
+    let mut total = 0.0;
+    for i in 0..len(nums) {
+        total = total + nums[i];
+    }
+    return total;
+}
+
+// Product of all integers in a list.
+fn product(nums: list<int>) -> int {
+    let mut result = 1;
+    for i in 0..len(nums) {
+        result = result * nums[i];
+    }
+    return result;
+}
+
+// Arithmetic mean of an integer list (returns float).
+// Returns 0.0 for an empty list.
+fn average(nums: list<int>) -> float {
+    if len(nums) == 0 {
+        return 0.0;
+    }
+    let mut total = 0;
+    for i in 0..len(nums) {
+        total = total + nums[i];
+    }
+    return toFloat(total) / toFloat(len(nums));
+}
+
+// Maximum value in a non-empty integer list.
+fn max_of(nums: list<int>) -> int {
+    let mut m = nums[0];
+    for i in 1..len(nums) {
+        if nums[i] > m {
+            m = nums[i];
+        }
+    }
+    return m;
+}
+
+// Minimum value in a non-empty integer list.
+fn min_of(nums: list<int>) -> int {
+    let mut m = nums[0];
+    for i in 1..len(nums) {
+        if nums[i] < m {
+            m = nums[i];
+        }
+    }
+    return m;
+}
+
+// ── Slicing ───────────────────────────────────────────────────────────────────
+
+// Return the first n elements of a list.
+fn take(xs: list<int>, n: int) -> list<int> {
+    return slice(xs, 0, n);
+}
+
+// Drop the first n elements and return the rest.
+fn drop(xs: list<int>, n: int) -> list<int> {
+    let rest = len(xs) - n;
+    if rest <= 0 {
+        return [];
+    }
+    return slice(xs, n, rest);
+}
+
+// ── Construction ──────────────────────────────────────────────────────────────
+
+// Create a list containing n copies of an integer value.
+fn repeat_int(elem: int, n: int) -> list<int> {
+    let mut result: list<int> = [];
+    for i in 0..n {
+        result = push(result, elem);
+    }
+    return result;
+}
+
+// Flatten a list of integer lists into a single flat list.
+fn flatten(lists: list<list<int>>) -> list<int> {
+    let mut result: list<int> = [];
+    for i in 0..len(lists) {
+        let inner = lists[i];
+        for j in 0..len(inner) {
+            result = push(result, inner[j]);
+        }
+    }
+    return result;
+}
+
+// ── Predicates (HOF) ──────────────────────────────────────────────────────────
+
+// Count elements for which pred(elem) returns true.
+fn count_if<F>(pred: F, xs: list<int>) -> int {
+    let mut count = 0;
+    for i in 0..len(xs) {
+        if pred(xs[i]) {
+            count = count + 1;
+        }
+    }
+    return count;
+}
+
+// Returns true if at least one element satisfies pred.
+fn any_of<F>(pred: F, xs: list<int>) -> bool {
+    for i in 0..len(xs) {
+        if pred(xs[i]) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Returns true if every element satisfies pred.
+fn all_of<F>(pred: F, xs: list<int>) -> bool {
+    for i in 0..len(xs) {
+        if !pred(xs[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// ── Accumulation ─────────────────────────────────────────────────────────────
+
+// Collect integers from start (inclusive) to end (exclusive) into a list.
+// Equivalent to the built-in range() but as an explicit function.
+fn iota(start: int, end: int) -> list<int> {
+    let mut result: list<int> = [];
+    for i in start..end {
+        result = push(result, i);
+    }
+    return result;
+}
+
+// Cumulative sum: returns a new list where result[i] = sum of xs[0..=i].
+fn cumsum(xs: list<int>) -> list<int> {
+    let mut result: list<int> = [];
+    let mut total = 0;
+    for i in 0..len(xs) {
+        total = total + xs[i];
+        result = push(result, total);
+    }
+    return result;
+}

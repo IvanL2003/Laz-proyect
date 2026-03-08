@@ -1,5 +1,8 @@
 // hello.laz - Laz demonstration program
 // Struct definition
+package hello;
+import en;
+
 struct Point {
     x: float,
     y: float,
@@ -85,4 +88,6 @@ fn main() -> void {
     print(f"typeOf(greeting): {typeOf(greeting)}");
     print(f"typeOf(is_awesome): {typeOf(is_awesome)}");
     print(f"typeOf(p1): {typeOf(p1)}");
+
+    en::write_hello();
 }

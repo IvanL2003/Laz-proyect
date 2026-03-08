@@ -374,6 +374,8 @@ impl Environment {
 enum StmtResult {
     Normal,
     Return(Value),
+    Break,
+    Continue,
 }
 
 // Represents the physical data source after resolving a SqlTableRef.
@@ -398,6 +400,14 @@ pub struct Interpreter {
     // execute_block_inner lo detecta tras cada statement y emite StmtResult::Return.
     try_return: Option<Value>,
 }
+
+/// Built-in standard library modules embedded at compile time.
+/// Each entry is (package_name, laz_source_code).
+const STDLIB: &[(&str, &str)] = &[
+    ("math",        include_str!("../../stdlib/math.lz")),
+    ("collections", include_str!("../../stdlib/collections.lz")),
+    ("strings",     include_str!("../../stdlib/strings.lz")),
+];
 
 impl Interpreter {
     pub fn new(base_dir: PathBuf) -> Self {
@@ -495,8 +505,11 @@ impl Interpreter {
                 Declaration::Connect(c) => {
                     self.register_connect(c);
                 }
-                Declaration::Import { path, span } => {
-                    self.process_import(path, *span)?;
+                Declaration::Import { kind, span } => {
+                    self.dispatch_import(kind, *span)?;
+                }
+                Declaration::Package { .. } => {
+                    // Declaración de metadato — no hace nada en runtime
                 }
                 Declaration::Statement(_) => {}
             }
@@ -523,18 +536,125 @@ impl Interpreter {
         Ok(())
     }
 
-    fn process_import(&mut self, path: &str, span: Span) -> Result<(), RuntimeError> {
+    // ─── Import dispatch ─────────────────────────────────────────────────────
+
+    fn dispatch_import(&mut self, kind: &ImportKind, span: Span) -> Result<(), RuntimeError> {
+        match kind {
+            // import "path.lz";  /  import "path.lz" as alias;
+            ImportKind::Path { path, alias } => {
+                self.load_file(path, alias.as_deref(), None, span)
+            }
+            // import math;  /  import math as m;
+            // Priority: base_dir → $LAZ_PATH → built-in stdlib → error
+            ImportKind::Named { package, alias } => {
+                let ns = alias.as_deref().unwrap_or(package.as_str());
+                // 1. Filesystem (base_dir → $LAZ_PATH) takes precedence
+                if let Ok(path) = self.resolve_package(package, span) {
+                    return self.load_file(&path, Some(ns), None, span);
+                }
+                // 2. Built-in stdlib
+                if let Some(&(_, src)) = STDLIB.iter().find(|&&(name, _)| name == package.as_str()) {
+                    return self.load_source_str(src, package, Some(ns), None, span);
+                }
+                // 3. Not found — emit error via resolve_package
+                Err(RuntimeError {
+                    message: format!(
+                        "cannot find package '{}' — expected '{}.lz' in base directory or $LAZ_PATH",
+                        package, package
+                    ),
+                    span,
+                })
+            }
+            // import { cos, sin } from math;  /  from "math.lz";
+            // Priority: literal path > base_dir > $LAZ_PATH > built-in stdlib > error
+            ImportKind::Selective { source, items } => {
+                match source {
+                    ImportSource::Path(p) => {
+                        self.load_file(p, None, Some((items, p.as_str())), span)
+                    }
+                    ImportSource::Named(pkg) => {
+                        // 1. Filesystem first
+                        if let Ok(path) = self.resolve_package(pkg, span) {
+                            return self.load_file(&path, None, Some((items, pkg.as_str())), span);
+                        }
+                        // 2. Built-in stdlib
+                        if let Some(&(_, src)) = STDLIB.iter().find(|&&(name, _)| name == pkg.as_str()) {
+                            return self.load_source_str(src, pkg, None, Some((items, pkg.as_str())), span);
+                        }
+                        // 3. Error
+                        Err(RuntimeError {
+                            message: format!(
+                                "cannot find package '{}' — expected '{}.lz' in base directory or $LAZ_PATH",
+                                pkg, pkg
+                            ),
+                            span,
+                        })
+                    }
+                }
+            }
+        }
+    }
+
+    /// Busca el archivo que corresponde a un nombre de paquete:
+    ///   1. base_dir/math.lz
+    ///   2. directorios en $LAZ_PATH
+    fn resolve_package(&self, package: &str, span: Span) -> Result<String, RuntimeError> {
+        let filename = format!("{}.lz", package);
+
+        // 1. Mismo directorio que el archivo actual
+        let candidate = self.base_dir.join(&filename);
+        if candidate.exists() {
+            return Ok(filename);
+        }
+
+        // 2. Directorios en $LAZ_PATH (separados por ':' en Unix, ';' en Windows)
+        if let Ok(laz_path) = std::env::var("LAZ_PATH") {
+            let sep = if cfg!(windows) { ';' } else { ':' };
+            for dir in laz_path.split(sep) {
+                let candidate = std::path::PathBuf::from(dir).join(&filename);
+                if candidate.exists() {
+                    return Ok(candidate.to_string_lossy().to_string());
+                }
+            }
+        }
+
+        Err(RuntimeError {
+            message: format!(
+                "cannot find package '{}' — expected '{}' in base directory or $LAZ_PATH",
+                package, filename
+            ),
+            span,
+        })
+    }
+
+    /// Carga un archivo .lz y registra sus declaraciones.
+    ///
+    /// `alias`    — Some("math") → funciones como "math::fn"; None → scope global
+    /// `filter`   — Some(items)  → solo registrar las funciones listadas (import selectivo)
+    fn load_file(
+        &mut self,
+        path: &str,
+        alias: Option<&str>,
+        filter: Option<(&Vec<ImportItem>, &str)>,
+        span: Span,
+    ) -> Result<(), RuntimeError> {
         use crate::lexer::Lexer;
         use crate::parser::Parser;
 
         let full_path = self.base_dir.join(path);
-        let canonical = full_path.canonicalize().unwrap_or(full_path.clone());
 
-        // Evitar imports circulares
-        if self.imported_files.contains(&canonical) {
-            return Ok(()); // ya importado, no hacer nada
+        // Clave de deduplicación: (canonical_path, alias, filter_names)
+        let canonical = full_path.canonicalize().unwrap_or(full_path.clone());
+        let dedup_key = format!(
+            "{}::{}::{}",
+            canonical.display(),
+            alias.unwrap_or(""),
+            filter.map(|(items, _)| items.iter().map(|i| i.name.as_str()).collect::<Vec<_>>().join(",")).unwrap_or_default()
+        );
+        if self.imported_files.contains(&std::path::PathBuf::from(&dedup_key)) {
+            return Ok(());
         }
-        self.imported_files.insert(canonical.clone());
+        self.imported_files.insert(std::path::PathBuf::from(&dedup_key));
 
         let source = std::fs::read_to_string(&full_path).map_err(|e| RuntimeError {
             message: format!("cannot import '{}': {}", path, e),
@@ -551,11 +671,24 @@ impl Interpreter {
             span,
         })?;
 
-        // Solo registrar funciones, structs, enums y connects — no ejecutar statements
         for decl in &program.declarations {
             match decl {
                 Declaration::Function(f) => {
-                    self.functions.insert(f.name.clone(), f.clone());
+                    if let Some((items, _)) = filter {
+                        // Import selectivo — solo registrar si el nombre está en la lista
+                        if let Some(item) = items.iter().find(|i| i.name == f.name) {
+                            // La función entra al scope global con su nombre (o alias)
+                            let key = item.alias.as_deref().unwrap_or(&f.name).to_string();
+                            self.functions.insert(key, f.clone());
+                        }
+                    } else {
+                        // Import completo — con namespace o sin él
+                        let key = match alias {
+                            Some(ns) => format!("{}::{}", ns, f.name),
+                            None => f.name.clone(),
+                        };
+                        self.functions.insert(key, f.clone());
+                    }
                 }
                 Declaration::Struct(s) => {
                     self.structs.insert(s.name.clone(), s.clone());
@@ -564,14 +697,79 @@ impl Interpreter {
                 Declaration::Connect(c) => {
                     self.register_connect(c);
                 }
-                Declaration::Import {
-                    path: inner_path,
-                    span: inner_span,
-                } => {
-                    // imports transitivos
-                    self.process_import(inner_path, *inner_span)?;
+                Declaration::Package { .. } => {
+                    // Metadato — ignorar en runtime
+                }
+                Declaration::Import { kind, span: inner_span } => {
+                    self.dispatch_import(kind, *inner_span)?;
                 }
                 Declaration::Statement(_) => {}
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Load and register a stdlib module from an embedded source string.
+    ///
+    /// `label`   — human-readable name used in error messages (e.g. "math")
+    /// `alias`   — namespace prefix for all registered functions (Some("math") → "math::fn")
+    /// `filter`  — optional selective import list
+    fn load_source_str(
+        &mut self,
+        source: &str,
+        label: &str,
+        alias: Option<&str>,
+        filter: Option<(&Vec<ImportItem>, &str)>,
+        span: Span,
+    ) -> Result<(), RuntimeError> {
+        use crate::lexer::Lexer;
+        use crate::parser::Parser;
+
+        // Dedup key: avoids re-registering the same stdlib module
+        let dedup_key = format!(
+            "stdlib::{}::{}::{}",
+            label,
+            alias.unwrap_or(""),
+            filter
+                .map(|(items, _)| items.iter().map(|i| i.name.as_str()).collect::<Vec<_>>().join(","))
+                .unwrap_or_default()
+        );
+        if self.imported_files.contains(&std::path::PathBuf::from(&dedup_key)) {
+            return Ok(());
+        }
+        self.imported_files.insert(std::path::PathBuf::from(&dedup_key));
+
+        let tokens = Lexer::new(source).tokenize().map_err(|e| RuntimeError {
+            message: format!("stdlib '{}' lexer error: {}", label, e.message),
+            span,
+        })?;
+        let program = Parser::new(tokens).parse().map_err(|e| RuntimeError {
+            message: format!("stdlib '{}' parse error: {}", label, e.message),
+            span,
+        })?;
+
+        for decl in &program.declarations {
+            match decl {
+                Declaration::Function(f) => {
+                    if let Some((items, _)) = filter {
+                        if let Some(item) = items.iter().find(|i| i.name == f.name) {
+                            let key = item.alias.as_deref().unwrap_or(&f.name).to_string();
+                            self.functions.insert(key, f.clone());
+                        }
+                    } else {
+                        let key = match alias {
+                            Some(ns) => format!("{}::{}", ns, f.name),
+                            None => f.name.clone(),
+                        };
+                        self.functions.insert(key, f.clone());
+                    }
+                }
+                Declaration::Struct(s) => {
+                    self.structs.insert(s.name.clone(), s.clone());
+                }
+                Declaration::Package { .. } => {}
+                _ => {}
             }
         }
 
@@ -614,7 +812,8 @@ impl Interpreter {
                         return Ok(StmtResult::Return(val));
                     }
                 }
-                ret @ StmtResult::Return(_) => return Ok(ret),
+                // Return, Break, Continue burbujean hacia arriba sin modificación
+                other => return Ok(other),
             }
         }
         Ok(StmtResult::Normal)
@@ -785,6 +984,8 @@ impl Interpreter {
 
                     match self.execute_block(body)? {
                         StmtResult::Normal => {}
+                        StmtResult::Break => break,
+                        StmtResult::Continue => continue,
                         ret @ StmtResult::Return(_) => return Ok(ret),
                     }
                 }
@@ -814,7 +1015,7 @@ impl Interpreter {
                     }
                 };
 
-                for i in start_i..end_i {
+                'range: for i in start_i..end_i {
                     // Nuevo scope por iteracion para aislar la variable del bucle
                     self.environment.push_scope();
                     self.environment
@@ -824,6 +1025,8 @@ impl Interpreter {
 
                     match result? {
                         StmtResult::Normal => {}
+                        StmtResult::Break => break 'range,
+                        StmtResult::Continue => continue 'range,
                         ret @ StmtResult::Return(_) => return Ok(ret),
                     }
                 }
@@ -840,7 +1043,7 @@ impl Interpreter {
 
                 match iterable_val {
                     Value::List(items) => {
-                        for item in items {
+                        'list: for item in items {
                             self.environment.push_scope();
 
                             if variable.len() == 1 {
@@ -894,12 +1097,14 @@ impl Interpreter {
                             self.environment.pop_scope();
                             match result? {
                                 StmtResult::Normal => {}
+                                StmtResult::Break => break 'list,
+                                StmtResult::Continue => continue 'list,
                                 ret @ StmtResult::Return(_) => return Ok(ret),
                             }
                         }
                     }
                     Value::Dict(d) => {
-                        for (k, v) in d {
+                        'dict: for (k, v) in d {
                             self.environment.push_scope();
                             if variable.len() >= 2 {
                                 // for key, value in dict { }
@@ -920,6 +1125,8 @@ impl Interpreter {
                             self.environment.pop_scope();
                             match result? {
                                 StmtResult::Normal => {}
+                                StmtResult::Break => break 'dict,
+                                StmtResult::Continue => continue 'dict,
                                 ret @ StmtResult::Return(_) => return Ok(ret),
                             }
                         }
@@ -934,6 +1141,9 @@ impl Interpreter {
                 Ok(StmtResult::Normal)
             
             }
+            Stmt::Break { .. } => Ok(StmtResult::Break),
+            Stmt::Continue { .. } => Ok(StmtResult::Continue),
+
             // return 42;   value=Some(expr)   --> StmtResult::Return(Value)
             // return;      value=None          --> StmtResult::Return(Void)
             // StmtResult::Return burbujea hasta call_function, que lo extrae
@@ -1800,15 +2010,48 @@ impl Interpreter {
                     span,
                 });
             }
+
+            // For namespaced functions ("ns::fn"), temporarily inject all sibling functions
+            // under their short names so recursive/cross calls within the module work.
+            // E.g. "math::lcm" calling "gcd" → "gcd" is available during execution.
+            let siblings: Vec<(String, FnDecl)> = if let Some(sep) = name.find("::") {
+                let prefix = format!("{}::", &name[..sep]);
+                self.functions.iter()
+                    .filter(|(k, _)| k.starts_with(prefix.as_str()))
+                    .map(|(k, v)| (k[prefix.len()..].to_string(), v.clone()))
+                    .collect()
+            } else {
+                vec![]
+            };
+            // Save previously existing short-named entries, then insert siblings
+            let mut saved: Vec<(String, Option<FnDecl>)> = Vec::with_capacity(siblings.len());
+            for (short, decl) in &siblings {
+                saved.push((short.clone(), self.functions.get(short.as_str()).cloned()));
+                self.functions.insert(short.clone(), decl.clone());
+            }
+
             self.environment.push_scope();
             for (param, arg) in func.params.iter().zip(args) {
                 self.environment.define(param.name.clone(), arg, false);
             }
             let result = self.execute_block_inner(&func.body);
             self.environment.pop_scope();
+
+            // Restore: undo sibling injection
+            for (short, prev) in saved {
+                match prev {
+                    Some(prev_decl) => { self.functions.insert(short, prev_decl); }
+                    None => { self.functions.remove(&short); }
+                }
+            }
+
             return match result? {
                 StmtResult::Normal => Ok(Value::Void),
                 StmtResult::Return(val) => Ok(val),
+                StmtResult::Break | StmtResult::Continue => {
+                    // break/continue fuera de un bucle (dentro de una función no es válido)
+                    Ok(Value::Void)
+                }
             };
         }
 
@@ -1868,6 +2111,7 @@ impl Interpreter {
         match result? {
             StmtResult::Normal => Ok(Value::Void),
             StmtResult::Return(val) => Ok(val),
+            StmtResult::Break | StmtResult::Continue => Ok(Value::Void),
         }
     }
 
@@ -2030,6 +2274,11 @@ impl Interpreter {
             (Value::Dict(_), TypeAnnotation::Dict(_, _)) => true,
             // Allow int -> float promotion in let bindings
             (Value::Int(_), TypeAnnotation::Float) => true,
+            // Generic instantiation annotations (e.g. Pair<int, string>) — accept any value.
+            // Runtime monomorphization is not performed; the interpreter is dynamically typed.
+            (_, TypeAnnotation::Generic(_, _)) => true,
+            // A bare type parameter (e.g. T, A, B) stored as UserDefined — accept any value.
+            // This arises when a function annotates params/return with a type param name.
             _ => false,
         };
 
@@ -2069,6 +2318,14 @@ impl Interpreter {
             }
             TypeAnnotation::Option(inner) => format!("Option<{}>", Self::type_ann_name(inner)),
             TypeAnnotation::UserDefined(name) => name.clone(),
+            TypeAnnotation::Generic(name, args) => {
+                let args_str = args
+                    .iter()
+                    .map(|a| Self::type_ann_name(a))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("{}<{}>", name, args_str)
+            }
         }
     }
 }
@@ -3890,6 +4147,87 @@ let result = len(arr);
         assert!(matches!(get(&i, "result"), Value::Int(3)));
     }
 
+    // ── break / continue ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_break_while() {
+        let src = r#"
+let mut x = 0;
+while true {
+    x = x + 1;
+    if x == 3 {
+        break;
+    }
+}
+"#;
+        let i = run_ok(src);
+        assert!(matches!(get(&i, "x"), Value::Int(3)));
+    }
+
+    #[test]
+    fn test_break_for_range() {
+        let src = r#"
+let mut found = 0;
+for i in 0..100 {
+    if i == 7 {
+        found = i;
+        break;
+    }
+}
+"#;
+        let i = run_ok(src);
+        assert!(matches!(get(&i, "found"), Value::Int(7)));
+    }
+
+    #[test]
+    fn test_continue_for_range() {
+        // suma solo los pares de 0..10
+        let src = r#"
+let mut sum = 0;
+for i in 0..10 {
+    if i % 2 != 0 {
+        continue;
+    }
+    sum = sum + i;
+}
+"#;
+        let i = run_ok(src);
+        assert!(matches!(get(&i, "sum"), Value::Int(20))); // 0+2+4+6+8
+    }
+
+    #[test]
+    fn test_continue_while() {
+        let src = r#"
+let mut x = 0;
+let mut count = 0;
+while x < 10 {
+    x = x + 1;
+    if x % 2 == 0 {
+        continue;
+    }
+    count = count + 1;
+}
+"#;
+        let i = run_ok(src);
+        assert!(matches!(get(&i, "count"), Value::Int(5))); // 1,3,5,7,9
+    }
+
+    #[test]
+    fn test_break_for_each() {
+        let src = r#"
+let items = [10, 20, 30, 40];
+let mut result = 0;
+for item in items {
+    if item == 30 {
+        break;
+    }
+    result = item;
+}
+"#;
+        let i = run_ok(src);
+        assert!(matches!(get(&i, "result"), Value::Int(20)));
+    }
+
     // ── Lambdas ───────────────────────────────────────────────────────────────
 
     #[test]
@@ -4468,5 +4806,550 @@ match r {
             warnings.iter().any(|w| w.message.contains("wildcard") || w.message.contains("catch-all")),
             "expected wildcard warning but got: {:?}", warnings
         );
+    }
+
+    // ── Generics ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_generic_identity_fn() {
+        // fn identity<T>(x: T) -> T — works with int
+        let i = run_ok(r#"
+fn identity<T>(x: T) -> T {
+    return x;
+}
+let result = identity(42);
+"#);
+        assert!(matches!(get(&i, "result"), Value::Int(42)));
+    }
+
+    #[test]
+    fn test_generic_identity_fn_string() {
+        // fn identity<T>(x: T) -> T — works with string too (dynamically typed)
+        let i = run_ok(r#"
+fn identity<T>(x: T) -> T {
+    return x;
+}
+let result = identity("hello");
+"#);
+        assert!(matches!(get(&i, "result"), Value::Str(ref s) if s == "hello"));
+    }
+
+    #[test]
+    fn test_generic_pair_struct() {
+        // struct Pair<A, B> { first: A, second: B }
+        let i = run_ok(r#"
+struct Pair<A, B> {
+    first: A,
+    second: B,
+}
+let p = Pair { first: 10, second: "ten" };
+let result = p.first;
+"#);
+        assert!(matches!(get(&i, "result"), Value::Int(10)));
+    }
+
+    #[test]
+    fn test_generic_type_annotation_on_let() {
+        // let p: Pair<int, string> = Pair { ... }
+        let i = run_ok(r#"
+struct Pair<A, B> {
+    first: A,
+    second: B,
+}
+let p: Pair<int, string> = Pair { first: 7, second: "seven" };
+let result = p.second;
+"#);
+        assert!(matches!(get(&i, "result"), Value::Str(ref s) if s == "seven"));
+    }
+
+    #[test]
+    fn test_generic_wrap_fn() {
+        // fn wrap<T>(x: T) -> list<T> — returns a single-element list
+        let i = run_ok(r#"
+fn wrap<T>(x: T) -> list<T> {
+    return [x];
+}
+let result = wrap(99);
+"#);
+        if let Value::List(items) = get(&i, "result") {
+            assert_eq!(items.len(), 1);
+            assert!(matches!(items[0], Value::Int(99)));
+        } else {
+            panic!("expected list");
+        }
+    }
+
+    #[test]
+    fn test_generic_two_params() {
+        // fn swap<A, B>(a: A, b: B) -> B
+        let i = run_ok(r#"
+fn second<A, B>(a: A, b: B) -> B {
+    return b;
+}
+let result = second(1, "world");
+"#);
+        assert!(matches!(get(&i, "result"), Value::Str(ref s) if s == "world"));
+    }
+
+    // ── Módulos / import namespaced ───────────────────────────────────────────
+
+    /// Crea un directorio temporal con un archivo .lz de biblioteca,
+    /// luego ejecuta `main_src` con ese directorio como base.
+    fn run_with_lib(test_name: &str, lib_name: &str, lib_src: &str, main_src: &str) -> Interpreter {
+        let tmp = std::env::temp_dir().join(format!("laz_test_{}", test_name));
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join(lib_name), lib_src).unwrap();
+
+        let tokens = Lexer::new(main_src).tokenize().expect("lex failed");
+        let program = Parser::new(tokens).parse().expect("parse failed");
+        if let Err(errors) = TypeChecker::check(&program, &tmp) {
+            panic!("type check failed: {:?}", errors);
+        }
+        let mut interp = Interpreter::new(tmp);
+        interp.run(&program).expect("runtime failed");
+        interp
+    }
+
+    // ── import "path.lz" (path-based) ────────────────────────────────────────
+
+    #[test]
+    fn test_import_path_no_alias_global_scope() {
+        let lib = "fn double(x: int) -> int { return x * 2; }\n";
+        let main = "import \"lib.lz\";\nlet result = double(21);\n";
+        let i = run_with_lib("import_no_alias", "lib.lz", lib, main);
+        assert!(matches!(get(&i, "result"), Value::Int(42)));
+    }
+
+    #[test]
+    fn test_import_path_with_alias_namespace_call() {
+        let lib = "fn double(x: int) -> int { return x * 2; }\nfn square(x: int) -> int { return x * x; }\n";
+        let main = "import \"math.lz\" as math;\nlet a = math::double(5);\nlet b = math::square(4);\n";
+        let i = run_with_lib("import_path_alias", "math.lz", lib, main);
+        assert!(matches!(get(&i, "a"), Value::Int(10)));
+        assert!(matches!(get(&i, "b"), Value::Int(16)));
+    }
+
+    // ── import math (named/package-based) ────────────────────────────────────
+
+    #[test]
+    fn test_import_named_resolves_by_filename() {
+        // import math; → busca math.lz en el mismo directorio
+        let lib = "fn triple(x: int) -> int { return x * 3; }\n";
+        let main = "import math;\nlet result = math::triple(7);\n";
+        let i = run_with_lib("import_named", "math.lz", lib, main);
+        assert!(matches!(get(&i, "result"), Value::Int(21)));
+    }
+
+    #[test]
+    fn test_import_named_with_alias() {
+        // import math as m; → funciones como m::fn
+        let lib = "fn pi() -> float { return 3.14; }\n";
+        let main = "import math as m;\nlet result = m::pi();\n";
+        let i = run_with_lib("import_named_alias", "math.lz", lib, main);
+        assert!(matches!(get(&i, "result"), Value::Float(f) if (f - 3.14).abs() < 1e-9));
+    }
+
+    #[test]
+    fn test_import_named_does_not_pollute_global() {
+        let lib = "fn secret() -> int { return 99; }\n";
+        let main = "import mylib;\nlet result = mylib::secret();\n";
+        let i = run_with_lib("import_named_no_pollute", "mylib.lz", lib, main);
+        assert!(matches!(get(&i, "result"), Value::Int(99)));
+        assert!(!i.functions.contains_key("secret"));
+        assert!(i.functions.contains_key("mylib::secret"));
+    }
+
+    // ── import { fn } from ... (selective) ───────────────────────────────────
+
+    #[test]
+    fn test_import_selective_from_path() {
+        // Solo se carga 'double', no 'square'
+        let lib = "fn double(x: int) -> int { return x * 2; }\nfn square(x: int) -> int { return x * x; }\n";
+        let main = "import { double } from \"mathlib.lz\";\nlet result = double(10);\n";
+        let i = run_with_lib("import_selective_path", "mathlib.lz", lib, main);
+        assert!(matches!(get(&i, "result"), Value::Int(20)));
+        // square NO debe estar en el scope global
+        assert!(!i.functions.contains_key("square"));
+        assert!(i.functions.contains_key("double"));
+    }
+
+    #[test]
+    fn test_import_selective_from_named() {
+        // import { double, square } from math;
+        let lib = "fn double(x: int) -> int { return x * 2; }\nfn square(x: int) -> int { return x * x; }\n";
+        let main = "import { double, square } from math;\nlet a = double(3);\nlet b = square(3);\n";
+        let i = run_with_lib("import_selective_named", "math.lz", lib, main);
+        assert!(matches!(get(&i, "a"), Value::Int(6)));
+        assert!(matches!(get(&i, "b"), Value::Int(9)));
+    }
+
+    #[test]
+    fn test_import_selective_with_rename() {
+        // import { double as twice } from math;
+        let lib = "fn double(x: int) -> int { return x * 2; }\n";
+        let main = "import { double as twice } from math;\nlet result = twice(5);\n";
+        let i = run_with_lib("import_selective_rename", "math.lz", lib, main);
+        assert!(matches!(get(&i, "result"), Value::Int(10)));
+        // 'double' no debe estar disponible sin renombrar
+        assert!(!i.functions.contains_key("double"));
+        assert!(i.functions.contains_key("twice"));
+    }
+
+    #[test]
+    fn test_import_selective_multiple_namespaces_no_collision() {
+        // Dos librerías con función del mismo nombre importadas selectivamente con rename
+        let lib_a = "fn greet() -> string { return \"hello\"; }\n";
+        let lib_b = "fn greet() -> string { return \"hola\"; }\n";
+        let tmp = std::env::temp_dir().join("laz_test_selective_multi");
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("en.lz"), lib_a).unwrap();
+        std::fs::write(tmp.join("es.lz"), lib_b).unwrap();
+
+        let main_src = "import { greet as greet_en } from \"en.lz\";\nimport { greet as greet_es } from \"es.lz\";\nlet a = greet_en();\nlet b = greet_es();\n";
+        let tokens = Lexer::new(main_src).tokenize().expect("lex failed");
+        let program = Parser::new(tokens).parse().expect("parse failed");
+        if let Err(e) = TypeChecker::check(&program, &tmp) { panic!("{:?}", e); }
+        let mut interp = Interpreter::new(tmp);
+        interp.run(&program).expect("runtime failed");
+        assert!(matches!(get(&interp, "a"), Value::Str(ref s) if s == "hello"));
+        assert!(matches!(get(&interp, "b"), Value::Str(ref s) if s == "hola"));
+    }
+
+    // ── package declaration ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_package_declaration_is_valid_and_ignored_at_runtime() {
+        // package math; al comienzo de un archivo no causa error
+        let lib = "package math;\nfn add(a: int, b: int) -> int { return a + b; }\n";
+        let main = "import math;\nlet result = math::add(3, 4);\n";
+        let i = run_with_lib("package_decl", "math.lz", lib, main);
+        assert!(matches!(get(&i, "result"), Value::Int(7)));
+    }
+
+    // ── Stdlib (embedded) ─────────────────────────────────────────────────────
+
+    // ── stdlib: math ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_stdlib_math_factorial() {
+        let i = run_ok("import math;\nlet result = math::factorial(5);");
+        assert!(matches!(get(&i, "result"), Value::Int(120)));
+    }
+
+    #[test]
+    fn test_stdlib_math_factorial_zero() {
+        let i = run_ok("import math;\nlet result = math::factorial(0);");
+        assert!(matches!(get(&i, "result"), Value::Int(1)));
+    }
+
+    #[test]
+    fn test_stdlib_math_gcd() {
+        let i = run_ok("import math;\nlet result = math::gcd(48, 18);");
+        assert!(matches!(get(&i, "result"), Value::Int(6)));
+    }
+
+    #[test]
+    fn test_stdlib_math_lcm() {
+        let i = run_ok("import math;\nlet result = math::lcm(4, 6);");
+        assert!(matches!(get(&i, "result"), Value::Int(12)));
+    }
+
+    #[test]
+    fn test_stdlib_math_clamp_below() {
+        let i = run_ok("import math;\nlet result = math::clamp(-5, 0, 10);");
+        assert!(matches!(get(&i, "result"), Value::Int(0)));
+    }
+
+    #[test]
+    fn test_stdlib_math_clamp_above() {
+        let i = run_ok("import math;\nlet result = math::clamp(15, 0, 10);");
+        assert!(matches!(get(&i, "result"), Value::Int(10)));
+    }
+
+    #[test]
+    fn test_stdlib_math_clamp_inside() {
+        let i = run_ok("import math;\nlet result = math::clamp(5, 0, 10);");
+        assert!(matches!(get(&i, "result"), Value::Int(5)));
+    }
+
+    #[test]
+    fn test_stdlib_math_is_even() {
+        let i = run_ok("import math;\nlet result = math::is_even(4);");
+        assert!(matches!(get(&i, "result"), Value::Bool(true)));
+    }
+
+    #[test]
+    fn test_stdlib_math_is_odd() {
+        let i = run_ok("import math;\nlet result = math::is_odd(7);");
+        assert!(matches!(get(&i, "result"), Value::Bool(true)));
+    }
+
+    #[test]
+    fn test_stdlib_math_sign_positive() {
+        let i = run_ok("import math;\nlet result = math::sign(42);");
+        assert!(matches!(get(&i, "result"), Value::Int(1)));
+    }
+
+    #[test]
+    fn test_stdlib_math_sign_negative() {
+        let i = run_ok("import math;\nlet result = math::sign(-7);");
+        assert!(matches!(get(&i, "result"), Value::Int(-1)));
+    }
+
+    #[test]
+    fn test_stdlib_math_sign_zero() {
+        let i = run_ok("import math;\nlet result = math::sign(0);");
+        assert!(matches!(get(&i, "result"), Value::Int(0)));
+    }
+
+    #[test]
+    fn test_stdlib_math_fib() {
+        let i = run_ok("import math;\nlet result = math::fib(10);");
+        assert!(matches!(get(&i, "result"), Value::Int(55)));
+    }
+
+    #[test]
+    fn test_stdlib_math_is_prime_true() {
+        let i = run_ok("import math;\nlet result = math::is_prime(13);");
+        assert!(matches!(get(&i, "result"), Value::Bool(true)));
+    }
+
+    #[test]
+    fn test_stdlib_math_is_prime_false() {
+        let i = run_ok("import math;\nlet result = math::is_prime(9);");
+        assert!(matches!(get(&i, "result"), Value::Bool(false)));
+    }
+
+    #[test]
+    fn test_stdlib_math_ipow() {
+        let i = run_ok("import math;\nlet result = math::ipow(2, 10);");
+        assert!(matches!(get(&i, "result"), Value::Int(1024)));
+    }
+
+    #[test]
+    fn test_stdlib_math_sum_to() {
+        // 1 + 2 + ... + 10 = 55
+        let i = run_ok("import math;\nlet result = math::sum_to(10);");
+        assert!(matches!(get(&i, "result"), Value::Int(55)));
+    }
+
+    // selective import from stdlib
+    #[test]
+    fn test_stdlib_math_selective_import() {
+        let i = run_ok("import { factorial } from math;\nlet result = factorial(6);");
+        assert!(matches!(get(&i, "result"), Value::Int(720)));
+    }
+
+    // aliased namespace import
+    #[test]
+    fn test_stdlib_math_alias_import() {
+        let i = run_ok("import math as m;\nlet result = m::fib(7);");
+        assert!(matches!(get(&i, "result"), Value::Int(13)));
+    }
+
+    // ── stdlib: collections ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_stdlib_collections_sum() {
+        let i = run_ok("import collections;\nlet result = collections::sum([1, 2, 3, 4, 5]);");
+        assert!(matches!(get(&i, "result"), Value::Int(15)));
+    }
+
+    #[test]
+    fn test_stdlib_collections_sum_empty() {
+        let i = run_ok("import collections;\nlet result = collections::sum([]);");
+        assert!(matches!(get(&i, "result"), Value::Int(0)));
+    }
+
+    #[test]
+    fn test_stdlib_collections_product() {
+        let i = run_ok("import collections;\nlet result = collections::product([1, 2, 3, 4]);");
+        assert!(matches!(get(&i, "result"), Value::Int(24)));
+    }
+
+    #[test]
+    fn test_stdlib_collections_average() {
+        let i = run_ok("import collections;\nlet result = collections::average([1, 2, 3, 4, 5]);");
+        assert!(matches!(get(&i, "result"), Value::Float(f) if (f - 3.0).abs() < 1e-9));
+    }
+
+    #[test]
+    fn test_stdlib_collections_max_of() {
+        let i = run_ok("import collections;\nlet result = collections::max_of([3, 1, 4, 1, 5, 9, 2, 6]);");
+        assert!(matches!(get(&i, "result"), Value::Int(9)));
+    }
+
+    #[test]
+    fn test_stdlib_collections_min_of() {
+        let i = run_ok("import collections;\nlet result = collections::min_of([3, 1, 4, 1, 5, 9, 2, 6]);");
+        assert!(matches!(get(&i, "result"), Value::Int(1)));
+    }
+
+    #[test]
+    fn test_stdlib_collections_take() {
+        let i = run_ok("import collections;\nlet result = collections::take([10, 20, 30, 40, 50], 3);");
+        if let Value::List(items) = get(&i, "result") {
+            assert_eq!(items, vec![Value::Int(10), Value::Int(20), Value::Int(30)]);
+        } else {
+            panic!("expected list");
+        }
+    }
+
+    #[test]
+    fn test_stdlib_collections_drop() {
+        let i = run_ok("import collections;\nlet result = collections::drop([10, 20, 30, 40, 50], 2);");
+        if let Value::List(items) = get(&i, "result") {
+            assert_eq!(items, vec![Value::Int(30), Value::Int(40), Value::Int(50)]);
+        } else {
+            panic!("expected list");
+        }
+    }
+
+    #[test]
+    fn test_stdlib_collections_flatten() {
+        let i = run_ok("import collections;\nlet result = collections::flatten([[1, 2], [3, 4], [5]]);");
+        if let Value::List(items) = get(&i, "result") {
+            assert_eq!(items, vec![Value::Int(1), Value::Int(2), Value::Int(3), Value::Int(4), Value::Int(5)]);
+        } else {
+            panic!("expected list");
+        }
+    }
+
+    #[test]
+    fn test_stdlib_collections_repeat_int() {
+        let i = run_ok("import collections;\nlet result = collections::repeat_int(7, 4);");
+        if let Value::List(items) = get(&i, "result") {
+            assert_eq!(items, vec![Value::Int(7), Value::Int(7), Value::Int(7), Value::Int(7)]);
+        } else {
+            panic!("expected list");
+        }
+    }
+
+    #[test]
+    fn test_stdlib_collections_iota() {
+        let i = run_ok("import collections;\nlet result = collections::iota(2, 6);");
+        if let Value::List(items) = get(&i, "result") {
+            assert_eq!(items, vec![Value::Int(2), Value::Int(3), Value::Int(4), Value::Int(5)]);
+        } else {
+            panic!("expected list");
+        }
+    }
+
+    #[test]
+    fn test_stdlib_collections_cumsum() {
+        let i = run_ok("import collections;\nlet result = collections::cumsum([1, 2, 3, 4]);");
+        if let Value::List(items) = get(&i, "result") {
+            assert_eq!(items, vec![Value::Int(1), Value::Int(3), Value::Int(6), Value::Int(10)]);
+        } else {
+            panic!("expected list");
+        }
+    }
+
+    #[test]
+    fn test_stdlib_collections_any_of_true() {
+        let i = run_ok("import collections;\nlet result = collections::any_of(|x| x > 4, [1, 2, 3, 4, 5]);");
+        assert!(matches!(get(&i, "result"), Value::Bool(true)));
+    }
+
+    #[test]
+    fn test_stdlib_collections_any_of_false() {
+        let i = run_ok("import collections;\nlet result = collections::any_of(|x| x > 10, [1, 2, 3, 4, 5]);");
+        assert!(matches!(get(&i, "result"), Value::Bool(false)));
+    }
+
+    #[test]
+    fn test_stdlib_collections_all_of_true() {
+        let i = run_ok("import collections;\nlet result = collections::all_of(|x| x > 0, [1, 2, 3]);");
+        assert!(matches!(get(&i, "result"), Value::Bool(true)));
+    }
+
+    #[test]
+    fn test_stdlib_collections_all_of_false() {
+        let i = run_ok("import collections;\nlet result = collections::all_of(|x| x > 2, [1, 2, 3, 4]);");
+        assert!(matches!(get(&i, "result"), Value::Bool(false)));
+    }
+
+    #[test]
+    fn test_stdlib_collections_count_if() {
+        let i = run_ok("import collections;\nlet result = collections::count_if(|x| x % 2 == 0, [1, 2, 3, 4, 5, 6]);");
+        assert!(matches!(get(&i, "result"), Value::Int(3)));
+    }
+
+    // selective import from collections
+    #[test]
+    fn test_stdlib_collections_selective_import() {
+        let i = run_ok("import { sum, product } from collections;\nlet s = sum([1, 2, 3]);\nlet p = product([2, 3, 4]);");
+        assert!(matches!(get(&i, "s"), Value::Int(6)));
+        assert!(matches!(get(&i, "p"), Value::Int(24)));
+    }
+
+    // ── stdlib: strings ───────────────────────────────────────────────────────
+
+    #[test]
+    fn test_stdlib_strings_repeat() {
+        let i = run_ok("import strings;\nlet result = strings::repeat(\"ab\", 3);");
+        assert!(matches!(get(&i, "result"), Value::Str(ref s) if s == "ababab"));
+    }
+
+    #[test]
+    fn test_stdlib_strings_repeat_zero() {
+        let i = run_ok("import strings;\nlet result = strings::repeat(\"x\", 0);");
+        assert!(matches!(get(&i, "result"), Value::Str(ref s) if s.is_empty()));
+    }
+
+    #[test]
+    fn test_stdlib_strings_lines() {
+        let i = run_ok("import strings;\nlet result = strings::lines(\"a\\nb\\nc\");");
+        if let Value::List(items) = get(&i, "result") {
+            assert_eq!(items.len(), 3);
+            assert!(matches!(&items[0], Value::Str(s) if s == "a"));
+            assert!(matches!(&items[1], Value::Str(s) if s == "b"));
+            assert!(matches!(&items[2], Value::Str(s) if s == "c"));
+        } else {
+            panic!("expected list");
+        }
+    }
+
+    #[test]
+    fn test_stdlib_strings_pad_left() {
+        let i = run_ok("import strings;\nlet result = strings::pad_left(\"42\", 5, \"0\");");
+        assert!(matches!(get(&i, "result"), Value::Str(ref s) if s == "00042"));
+    }
+
+    #[test]
+    fn test_stdlib_strings_pad_right() {
+        let i = run_ok("import strings;\nlet result = strings::pad_right(\"hi\", 5, \".\");");
+        assert!(matches!(get(&i, "result"), Value::Str(ref s) if s == "hi..."));
+    }
+
+    #[test]
+    fn test_stdlib_strings_is_palindrome_true() {
+        let i = run_ok("import strings;\nlet result = strings::is_palindrome(\"racecar\");");
+        assert!(matches!(get(&i, "result"), Value::Bool(true)));
+    }
+
+    #[test]
+    fn test_stdlib_strings_is_palindrome_false() {
+        let i = run_ok("import strings;\nlet result = strings::is_palindrome(\"hello\");");
+        assert!(matches!(get(&i, "result"), Value::Bool(false)));
+    }
+
+    #[test]
+    fn test_stdlib_strings_count_substr() {
+        let i = run_ok("import strings;\nlet result = strings::count_substr(\"banana\", \"an\");");
+        assert!(matches!(get(&i, "result"), Value::Int(2)));
+    }
+
+    #[test]
+    fn test_stdlib_strings_wrap() {
+        let i = run_ok("import strings;\nlet result = strings::wrap(\"world\", \"[\", \"]\");");
+        assert!(matches!(get(&i, "result"), Value::Str(ref s) if s == "[world]"));
+    }
+
+    // double import of same stdlib module is a no-op (dedup)
+    #[test]
+    fn test_stdlib_double_import_is_noop() {
+        let i = run_ok("import math;\nimport math;\nlet result = math::factorial(4);");
+        assert!(matches!(get(&i, "result"), Value::Int(24)));
     }
 }

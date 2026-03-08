@@ -104,7 +104,7 @@ impl Formatter {
                 Declaration::Enum(_) => "enum",
                 Declaration::Connect(_) => "connect",
                 Declaration::Statement(_) => "stmt",
-                Declaration::Import { .. } => "import",
+                Declaration::Import { .. } | Declaration::Package { .. } => "import",
             };
             if let Some(prev) = prev_decl_kind {
                 if prev != current_kind || current_kind == "fn" {
@@ -126,6 +126,7 @@ impl Formatter {
             Declaration::Connect(c) => c.span,
             Declaration::Statement(s) => self.stmt_span(s),
             Declaration::Import { span, .. } => *span,
+            Declaration::Package { span, .. } => *span,
         }
     }
 
@@ -136,11 +137,51 @@ impl Formatter {
             Declaration::Enum(e) => self.format_enum_decl(e),
             Declaration::Connect(c) => self.format_connect(c),
             Declaration::Statement(s) => self.format_statement(s),
-            Declaration::Import { path, span } => {
-                self.output.push_str(&format!("{}import \"{}\";\n", self.indent(), path));
+            Declaration::Package { name, span } => {
+                self.output.push_str(&format!("{}package {};\n", self.indent(), name));
                 self.emit_inline_comment(span.line);
             }
+            Declaration::Import { kind, span } => {
+                self.format_import(kind, *span);
+            }
         }
+    }
+
+    fn format_import(&mut self, kind: &ImportKind, span: Span) {
+        let line = self.indent();
+        match kind {
+            ImportKind::Path { path, alias: None } => {
+                self.output.push_str(&format!("{}import \"{}\";\n", line, path));
+            }
+            ImportKind::Path { path, alias: Some(ns) } => {
+                self.output.push_str(&format!("{}import \"{}\" as {};\n", line, path, ns));
+            }
+            ImportKind::Named { package, alias: None } => {
+                self.output.push_str(&format!("{}import {};\n", line, package));
+            }
+            ImportKind::Named { package, alias: Some(ns) } => {
+                self.output.push_str(&format!("{}import {} as {};\n", line, package, ns));
+            }
+            ImportKind::Selective { source, items } => {
+                let items_str = items
+                    .iter()
+                    .map(|i| match &i.alias {
+                        None => i.name.clone(),
+                        Some(a) => format!("{} as {}", i.name, a),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let source_str = match source {
+                    ImportSource::Path(p) => format!("\"{}\"", p),
+                    ImportSource::Named(pkg) => pkg.clone(),
+                };
+                self.output.push_str(&format!(
+                    "{}import {{ {} }} from {};\n",
+                    line, items_str, source_str
+                ));
+            }
+        }
+        self.emit_inline_comment(span.line);
     }
 
     fn format_enum_decl(&mut self, decl: &EnumDecl) {
@@ -197,10 +238,16 @@ impl Formatter {
     }
 
     fn format_struct_decl(&mut self, decl: &StructDecl, next_decl_line: usize) {
+        let type_params = if decl.type_params.is_empty() {
+            String::new()
+        } else {
+            format!("<{}>", decl.type_params.join(", "))
+        };
         self.output.push_str(&format!(
-            "{}struct {} {{\n",
+            "{}struct {}{} {{\n",
             self.indent(),
-            decl.name
+            decl.name,
+            type_params
         ));
         self.indent_level += 1;
 
@@ -222,6 +269,12 @@ impl Formatter {
     }
 
     fn format_fn_decl(&mut self, decl: &FnDecl, next_decl_line: usize) {
+        let type_params = if decl.type_params.is_empty() {
+            String::new()
+        } else {
+            format!("<{}>", decl.type_params.join(", "))
+        };
+
         let params = decl
             .params
             .iter()
@@ -232,9 +285,10 @@ impl Formatter {
         let return_type = format!(" -> {}", self.format_type(&decl.return_type));
 
         self.output.push_str(&format!(
-            "{}fn {}({}){} {{\n",
+            "{}fn {}{}({}){} {{\n",
             self.indent(),
             decl.name,
+            type_params,
             params,
             return_type
         ));
@@ -266,6 +320,14 @@ impl Formatter {
             }
             TypeAnnotation::Option(inner) => format!("Option<{}>", self.format_type(inner)),
             TypeAnnotation::UserDefined(name) => name.clone(),
+            TypeAnnotation::Generic(name, args) => {
+                let args_str = args
+                    .iter()
+                    .map(|a| self.format_type(a))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("{}<{}>", name, args_str)
+            }
         }
     }
 
@@ -473,6 +535,16 @@ impl Formatter {
                 self.emit_inline_comment(span.line);
             }
 
+            Stmt::Break { span } => {
+                self.output.push_str(&format!("{}break;\n", self.indent()));
+                self.emit_inline_comment(span.line);
+            }
+
+            Stmt::Continue { span } => {
+                self.output.push_str(&format!("{}continue;\n", self.indent()));
+                self.emit_inline_comment(span.line);
+            }
+
             Stmt::Match { subject, arms, span } => {
                 self.output.push_str(&format!(
                     "{}match {} {{\n",
@@ -512,7 +584,9 @@ impl Formatter {
             | Stmt::Print { span, .. }
             | Stmt::Expression { span, .. }
             | Stmt::Match { span, .. }
-            | Stmt::ForEach { span, .. } => *span,
+            | Stmt::ForEach { span, .. }
+            | Stmt::Break { span }
+            | Stmt::Continue { span } => *span,
         }
     }
 
@@ -883,5 +957,37 @@ mod tests {
         let first = format_code(input);
         let second = format_code(&first);
         assert_eq!(first, second, "Formatter should be idempotent");
+    }
+
+    #[test]
+    fn test_generic_fn_formatting() {
+        let result = format_code("fn identity<T>(x: T) -> T { return x; }");
+        assert!(result.contains("fn identity<T>(x: T) -> T {"), "got: {}", result);
+    }
+
+    #[test]
+    fn test_generic_fn_two_params_formatting() {
+        let result = format_code("fn second<A, B>(a: A, b: B) -> B { return b; }");
+        assert!(result.contains("fn second<A, B>(a: A, b: B) -> B {"), "got: {}", result);
+    }
+
+    #[test]
+    fn test_generic_struct_formatting() {
+        let result = format_code("struct Pair<A, B> { first: A, second: B }");
+        assert!(result.contains("struct Pair<A, B> {"), "got: {}", result);
+    }
+
+    #[test]
+    fn test_generic_type_annotation_formatting() {
+        let result = format_code("struct Pair<A, B> { first: A, second: B }\nfn main() -> void { let p: Pair<int, string> = Pair { first: 1, second: \"x\" }; }");
+        assert!(result.contains("let p: Pair<int, string> ="), "got: {}", result);
+    }
+
+    #[test]
+    fn test_generic_idempotent() {
+        let input = "fn identity<T>(x: T) -> T {\n    return x;\n}\n";
+        let first = format_code(input);
+        let second = format_code(&first);
+        assert_eq!(first, second, "Generic formatter should be idempotent");
     }
 }

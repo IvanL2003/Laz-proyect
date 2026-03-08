@@ -13,8 +13,43 @@ pub enum Declaration {
     Enum(EnumDecl),
     Connect(ConnectDecl),
     Statement(Stmt),
-    // import "otro_archivo.lz";
-    Import { path: String, span: Span },
+    // package math;
+    Package { name: String, span: Span },
+    // import "path.lz";  /  import math;  /  import { cos } from math;  etc.
+    Import { kind: ImportKind, span: Span },
+}
+
+// ─── Import kinds ──────────────────────────────────────────────────────────────
+
+/// Qué se importa y cómo
+#[derive(Debug, Clone)]
+pub enum ImportKind {
+    // import "path.lz";
+    // import "path.lz" as alias;
+    Path { path: String, alias: Option<String> },
+
+    // import math;
+    // import math as m;
+    Named { package: String, alias: Option<String> },
+
+    // import { cos, sin } from math;
+    // import { cos, sin } from "math.lz";
+    // import { cos as coseno } from math;
+    Selective { source: ImportSource, items: Vec<ImportItem> },
+}
+
+/// De dónde viene un import selectivo
+#[derive(Debug, Clone)]
+pub enum ImportSource {
+    Path(String),   // from "math.lz"
+    Named(String),  // from math
+}
+
+/// Un ítem en un import selectivo: cos  o  cos as coseno
+#[derive(Debug, Clone)]
+pub struct ImportItem {
+    pub name: String,
+    pub alias: Option<String>,
 }
 
 // enum Color { Red, Green, Blue }
@@ -51,9 +86,13 @@ pub struct DbMapping {
 
 // fn distance(p1: Point, p2: Point) -> float { ... }
 // name="distance"  params=[p1:Point, p2:Point]  return_type=Float
+//
+// fn identity<T>(x: T) -> T { ... }
+// name="identity"  type_params=["T"]  params=[x:UserDefined("T")]  return_type=UserDefined("T")
 #[derive(Debug, Clone)]
 pub struct FnDecl {
     pub name: String,
+    pub type_params: Vec<String>,        // [] = no generics, ["T"] = one, ["A","B"] = two, etc.
     pub params: Vec<Param>,
     pub return_type: TypeAnnotation,
     pub body: Block,
@@ -71,9 +110,13 @@ pub struct Param {
 
 // struct User { name: string, age: int }
 // name="User"  fields=[{name:string}, {age:int}]
+//
+// struct Pair<A, B> { first: A, second: B }
+// name="Pair"  type_params=["A","B"]  fields=[{first:UserDefined("A")}, {second:UserDefined("B")}]
 #[derive(Debug, Clone)]
 pub struct StructDecl {
     pub name: String,
+    pub type_params: Vec<String>,        // [] = concrete struct, ["A","B"] = generic struct
     pub fields: Vec<StructField>,
     pub span: Span,
 }
@@ -96,7 +139,8 @@ pub struct StructField {
 //   List(T)              -->  list<T>   ej: list<User>, list<list<string>>
 //   Result(T, E)         -->  Result<T, E>  ej: Result<int, string>
 //   Option(T)            -->  Option<T>     ej: Option<float>
-//   UserDefined(String)  -->  nombre de struct   ej: User, Point
+//   UserDefined(String)  -->  nombre de struct o parametro de tipo   ej: User, Point, T
+//   Generic(Name, args)  -->  instanciacion generica  ej: Pair<int, string>, Stack<User>
 #[derive(Debug, Clone, PartialEq)]
 pub enum TypeAnnotation {
     Int,
@@ -108,7 +152,8 @@ pub enum TypeAnnotation {
     Dict(Box<TypeAnnotation>, Box<TypeAnnotation>),              // dict<K, V>
     Result(Box<TypeAnnotation>, Box<TypeAnnotation>),             // Result<T, E>
     Option(Box<TypeAnnotation>),                                  // Option<T>
-    UserDefined(String),                                          // nombre del struct
+    UserDefined(String),                                          // nombre del struct o tipo param
+    Generic(String, Vec<TypeAnnotation>),                         // Pair<int, string>
 }
 
 #[derive(Debug, Clone)]
@@ -213,6 +258,12 @@ pub enum Stmt {
         arms: Vec<MatchArm>,
         span: Span,
     },
+
+    // break; — sale del bucle más cercano (while / for / for..in)
+    Break { span: Span },
+
+    // continue; — salta a la siguiente iteracion del bucle más cercano
+    Continue { span: Span },
 }
 
 // x = 5;      -->  Variable("x")

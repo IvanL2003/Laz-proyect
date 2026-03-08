@@ -1,0 +1,115 @@
+package math;
+
+// Returns n! (factorial). Requires n >= 0.
+fn factorial(n: int) -> int {
+    if n <= 1 {
+        return 1;
+    }
+    return n * factorial(n - 1);
+}
+
+// Greatest common divisor via the Euclidean algorithm.
+fn gcd(a: int, b: int) -> int {
+    if b == 0 {
+        return a;
+    }
+    return gcd(b, a % b);
+}
+
+// Least common multiple.
+fn lcm(a: int, b: int) -> int {
+    return (a / gcd(a, b)) * b;
+}
+
+// Clamp an integer to the closed range [lo, hi].
+fn clamp(x: int, lo: int, hi: int) -> int {
+    if x < lo {
+        return lo;
+    }
+    if x > hi {
+        return hi;
+    }
+    return x;
+}
+
+// Clamp a float to the closed range [lo, hi].
+fn clampf(x: float, lo: float, hi: float) -> float {
+    if x < lo {
+        return lo;
+    }
+    if x > hi {
+        return hi;
+    }
+    return x;
+}
+
+// Returns true if n is even.
+fn is_even(n: int) -> bool {
+    return n % 2 == 0;
+}
+
+// Returns true if n is odd.
+fn is_odd(n: int) -> bool {
+    return n % 2 != 0;
+}
+
+// Returns -1, 0, or 1 depending on the sign of n.
+fn sign(n: int) -> int {
+    if n > 0 {
+        return 1;
+    }
+    if n < 0 {
+        return -1;
+    }
+    return 0;
+}
+
+// Returns -1, 0, or 1 depending on the sign of x.
+fn signf(x: float) -> int {
+    if x > 0.0 {
+        return 1;
+    }
+    if x < 0.0 {
+        return -1;
+    }
+    return 0;
+}
+
+// Returns the nth Fibonacci number (0-indexed: fib(0)=0, fib(1)=1).
+fn fib(n: int) -> int {
+    if n <= 0 {
+        return 0;
+    }
+    if n == 1 {
+        return 1;
+    }
+    return fib(n - 1) + fib(n - 2);
+}
+
+// Returns true if n is a prime number (n >= 2).
+fn is_prime(n: int) -> bool {
+    if n < 2 {
+        return false;
+    }
+    let mut i = 2;
+    while i * i <= n {
+        if n % i == 0 {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// Sum of integers from 0 to n inclusive (Gauss formula).
+fn sum_to(n: int) -> int {
+    return n * (n + 1) / 2;
+}
+
+// Integer exponentiation: base ^ exp (exp >= 0).
+fn ipow(base: int, exp: int) -> int {
+    if exp == 0 {
+        return 1;
+    }
+    return base * ipow(base, exp - 1);
+}

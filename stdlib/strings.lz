@@ -1,0 +1,80 @@
+package strings;
+
+// Repeat string s exactly n times.
+fn repeat(s: string, n: int) -> string {
+    let mut result = "";
+    for i in 0..n {
+        result = result + s;
+    }
+    return result;
+}
+
+// Split a string into lines (splits on "\n").
+fn lines(s: string) -> list<string> {
+    return split(s, "\n");
+}
+
+// Pad s on the left with character c until total length is n.
+fn pad_left(s: string, n: int, c: string) -> string {
+    let mut result = s;
+    while len(result) < n {
+        result = c + result;
+    }
+    return result;
+}
+
+// Pad s on the right with character c until total length is n.
+fn pad_right(s: string, n: int, c: string) -> string {
+    let mut result = s;
+    while len(result) < n {
+        result = result + c;
+    }
+    return result;
+}
+
+// Returns true if s reads the same forwards and backwards.
+fn is_palindrome(s: string) -> bool {
+    return s == reverse(s);
+}
+
+// Count the number of (non-overlapping) occurrences of sub in s.
+// Returns 0 if sub is empty or not found.
+fn count_substr(s: string, sub: string) -> int {
+    if len(sub) == 0 {
+        return 0;
+    }
+    let parts = split(s, sub);
+    return len(parts) - 1;
+}
+
+// Returns true if s contains only lowercase letters and digits (no spaces).
+fn is_lower_alnum(s: string) -> bool {
+    return s == lower(s);
+}
+
+// Wrap a string with a prefix and suffix.
+fn wrap(s: string, prefix: string, suffix: string) -> string {
+    return prefix + s + suffix;
+}
+
+// Center s in a field of width n, padded with c.
+fn center(s: string, n: int, c: string) -> string {
+    let padding = n - len(s);
+    if padding <= 0 {
+        return s;
+    }
+    let left_pad = padding / 2;
+    let right_pad = padding - left_pad;
+    let mut result = s;
+    let mut i = 0;
+    while i < left_pad {
+        result = c + result;
+        i = i + 1;
+    }
+    let mut j = 0;
+    while j < right_pad {
+        result = result + c;
+        j = j + 1;
+    }
+    return result;
+}

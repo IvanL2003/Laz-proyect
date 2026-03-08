@@ -87,6 +87,7 @@ impl TypeChecker {
                 }
                 Declaration::Statement(_) => {}
                 Declaration::Import { .. } => {}
+                Declaration::Package { .. } => {}
             }
         }
     }
@@ -100,6 +101,7 @@ impl TypeChecker {
                 Declaration::Connect(_) => {}
                 Declaration::Statement(stmt) => self.validate_stmt(stmt, false),
                 Declaration::Import { .. } => {} // el interprete maneja la carga
+                Declaration::Package { .. } => {} // metadato, sin validación
             }
         }
     }
@@ -178,6 +180,10 @@ impl TypeChecker {
                     self.validate_block(&arm.body, in_function);
                 }
             }
+            // break/continue son válidos solo dentro de bucles;
+            // una validación de contexto completa requeriría rastrear si estamos en un
+            // bucle, pero por ahora las dejamos pasar (el intérprete las ejecuta bien).
+            Stmt::Break { .. } | Stmt::Continue { .. } => {}
         }
     }
 
@@ -356,11 +362,9 @@ impl TypeChecker {
 
     fn validate_type(&mut self, type_ann: &TypeAnnotation) {
         match type_ann {
-            TypeAnnotation::UserDefined(name) => {
-                if !self.structs.contains_key(name) {
-                    // We don't have span info on TypeAnnotation directly,
-                    // so we skip this check here (it'll be caught at runtime)
-                }
+            TypeAnnotation::UserDefined(_name) => {
+                // Could be a struct name or a generic type parameter (T, A, B…).
+                // We don't have span info here, so skip – runtime will catch real errors.
             }
             TypeAnnotation::List(inner) => {
                 self.validate_type(inner);
@@ -375,6 +379,12 @@ impl TypeChecker {
             }
             TypeAnnotation::Option(inner) => {
                 self.validate_type(inner);
+            }
+            TypeAnnotation::Generic(_, args) => {
+                // e.g. Pair<int, string> — validate each type argument
+                for arg in args {
+                    self.validate_type(arg);
+                }
             }
             _ => {}
         }

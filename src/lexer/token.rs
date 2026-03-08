@@ -51,6 +51,7 @@ pub enum TokenKind {
     As,
     Match,
     Import,
+    Package,
 
     // Type keywords
     IntType,
@@ -161,6 +162,7 @@ impl std::fmt::Display for TokenKind {
             TokenKind::As => write!(f, "as"),
             TokenKind::Match => write!(f, "match"),
             TokenKind::Import => write!(f, "import"),
+            TokenKind::Package => write!(f, "package"),
             TokenKind::IntType => write!(f, "int"),
             TokenKind::FloatType => write!(f, "float"),
             TokenKind::BoolType => write!(f, "bool"),
@@ -235,6 +237,8 @@ pub fn lookup_keyword(ident: &str) -> Option<TokenKind> {
         "print" => Some(TokenKind::Print),
         "struct" => Some(TokenKind::Struct),
         "enum" => Some(TokenKind::Enum),
+        "break" => Some(TokenKind::Break),
+        "continue" => Some(TokenKind::Continue),
         "connect" => Some(TokenKind::Connect),
         "file" => Some(TokenKind::File),
         "db" => Some(TokenKind::Db),
@@ -242,6 +246,7 @@ pub fn lookup_keyword(ident: &str) -> Option<TokenKind> {
         "as" => Some(TokenKind::As),
         "match" => Some(TokenKind::Match),
         "import" => Some(TokenKind::Import),
+        "package" => Some(TokenKind::Package),
         "true" => Some(TokenKind::BoolLiteral(true)),
         "false" => Some(TokenKind::BoolLiteral(false)),
         "int" => Some(TokenKind::IntType),

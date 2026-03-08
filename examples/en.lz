@@ -1,0 +1,5 @@
+package en;
+
+fn write_hello (){
+    print("Hello");
+}
