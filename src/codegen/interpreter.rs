@@ -36,6 +36,15 @@ pub enum Value {
     Some(Box<Value>),
     None,
     Void,
+    // Funcion de primera clase / closure
+    // params   -> parametros con nombre y tipo (del AST)
+    // body     -> bloque de codigo a ejecutar
+    // captured -> snapshot del entorno en el momento de definicion (closure)
+    Func {
+        params: Vec<Param>,
+        body: Block,
+        captured: HashMap<String, Value>,
+    },
 }
 
 impl PartialEq for Value {
@@ -65,6 +74,8 @@ impl PartialEq for Value {
                     fields: f2,
                 },
             ) => t1 == t2 && f1 == f2,
+            // Las funciones no tienen igualdad estructural
+            (Value::Func { .. }, Value::Func { .. }) => false,
             // Tipos distintos → siempre false
             _ => false,
         }
@@ -89,6 +100,51 @@ impl Value {
             Value::Some(_) => "some",
             Value::None => "none",
             Value::Void => "void",
+            Value::Func { .. } => "fn",
+        }
+    }
+    #[allow(dead_code)]
+    fn is_truthy(&self) -> bool {
+        match self {
+            Value::Int(i) => *i != 0,
+            Value::Float(f) => *f != 0.0,
+            Value::Bool(b) => *b,
+            Value::Str(s) => !s.is_empty(),
+            Value::List(l) => !l.is_empty(),
+            Value::Ok(_) | Value::Some(_) => true,
+            Value::Err(_) | Value::None | Value::Void => false,
+            Value::StructInstance { .. } => true,
+            Value::Func { .. } => true,
+        }
+    }
+    #[allow(dead_code)]
+    fn as_int(&self) -> Option<i64> {
+        match self {
+            Value::Int(i) => Some(*i),
+            Value::Float(f) => Some(*f as i64),
+            _ => None,
+        }
+    }
+    #[allow(dead_code)]
+    fn as_float(&self) -> Option<f64> {
+        match self {
+            Value::Int(i) => Some(*i as f64),
+            Value::Float(f) => Some(*f),
+            _ => None,
+        }
+    }
+    #[allow(dead_code)]
+    fn as_str(&self) -> Option<&str> {
+        match self {
+            Value::Str(s) => Some(s),
+            _ => None,
+        }
+    }
+    #[allow(dead_code)]
+    fn as_list(&self) -> Option<&Vec<Value>> {
+        match self {
+            Value::List(l) => Some(l),
+            _ => None,
         }
     }
 
@@ -120,6 +176,21 @@ impl Value {
             Value::Some(inner) => format!("some({})", inner.to_display_string()),
             Value::None => "none".to_string(),
             Value::Void => "void".to_string(),
+            Value::Func { params, .. } => {
+                let names: Vec<&str> = params.iter().map(|p| p.name.as_str()).collect();
+                format!("fn({})", names.join(", "))
+            }
+        }
+    }
+
+    fn partial_cmp(&self, b: &Value) -> Option<std::cmp::Ordering> {
+        match (self, b) {
+            (Value::Int(a), Value::Int(b)) => a.partial_cmp(b),
+            (Value::Float(a), Value::Float(b)) => a.partial_cmp(b),
+            (Value::Int(a), Value::Float(b)) => (*a as f64).partial_cmp(b),
+            (Value::Float(a), Value::Int(b)) => a.partial_cmp(&(*b as f64)),
+            (Value::Str(a), Value::Str(b)) => a.partial_cmp(b),
+            _ => None, // otros tipos no son comparables
         }
     }
 }
@@ -187,6 +258,20 @@ impl Environment {
             message: format!("undefined variable '{}'", name),
             span,
         })
+    }
+
+    // Snapshot de todas las variables visibles en el momento actual.
+    // Las variables de scopes internos sobreescriben las de scopes externos.
+    // Se usa para capturar el entorno en closures (Value::Func).
+    fn snapshot(&self) -> HashMap<String, Value> {
+        let mut map = HashMap::new();
+        for scope in self.scopes.iter() {
+            // exterior → interior: los internos sobreescriben
+            for (name, var) in scope {
+                map.insert(name.clone(), var.value.clone());
+            }
+        }
+        map
     }
 
     // Modifica una variable existente (solo si es mutable)
@@ -281,6 +366,15 @@ impl Interpreter {
         native_functions.insert("range".to_string(), native_range);
         native_functions.insert("indexOf".to_string(), native_index_of);
         native_functions.insert("lastIndexOf".to_string(), native_last_index_of);
+        native_functions.insert("sort".to_string(), native_sort);
+        native_functions.insert("zip".to_string(), native_zip);
+        native_functions.insert("unzip".to_string(), native_unzip);
+        native_functions.insert("first".to_string(), native_first);
+        native_functions.insert("last".to_string(), native_last);
+        native_functions.insert("concat".to_string(), native_concat);
+        native_functions.insert("reverse".to_string(), native_reverse);
+        native_functions.insert("slice".to_string(),native_slice);
+        
 
         Interpreter {
             environment: Environment::new(),
@@ -703,8 +797,28 @@ impl Interpreter {
             // true / false  -->  Value::Bool(bool)
             Expr::BoolLiteral { value, .. } => Ok(Value::Bool(*value)),
 
-            // x, name, users  -->  busca la variable en el Environment (scope mas interno primero)
-            Expr::Identifier { name, span } => self.environment.get(name, *span),
+            // x, name, users  -->  busca en el Environment primero.
+            // Si no está como variable pero sí como función declarada, devuelve Value::Func
+            // (primera clase: let f = add;)
+            Expr::Identifier { name, span } => match self.environment.get(name, *span) {
+                Ok(val) => Ok(val),
+                Err(_) => {
+                    let maybe_func = self.functions.get(name.as_str()).cloned();
+                    if let Some(func) = maybe_func {
+                        let captured = self.environment.snapshot();
+                        Ok(Value::Func {
+                            params: func.params,
+                            body: func.body,
+                            captured,
+                        })
+                    } else {
+                        Err(RuntimeError {
+                            message: format!("undefined variable '{}'", name),
+                            span: *span,
+                        })
+                    }
+                }
+            },
 
             // (expr)  -->  simplemente evalua la expresion interior, el agrupamiento no cambia el valor
             Expr::Grouped { expr, .. } => self.evaluate_expr(expr),
@@ -1320,44 +1434,235 @@ impl Interpreter {
         args: Vec<Value>,
         span: Span,
     ) -> Result<Value, RuntimeError> {
-        // Primero busca funciones nativas
+        // 0. HOFs que necesitan &mut self (no pueden estar en native_functions)
+        match name {
+            "map" => return self.builtin_map(args, span),
+            "filter" => return self.builtin_filter(args, span),
+            "reduce" => return self.builtin_reduce(args, span),
+            "sortBy" => return self.builtin_sort_by(args, span),
+            _ => {}
+        }
+
+        // 1. Funciones declaradas con fn (tienen prioridad sobre built-ins)
+        if let Some(func) = self.functions.get(name).cloned() {
+            if args.len() != func.params.len() {
+                return Err(RuntimeError {
+                    message: format!(
+                        "function '{}' expects {} arguments, got {}",
+                        name,
+                        func.params.len(),
+                        args.len()
+                    ),
+                    span,
+                });
+            }
+            self.environment.push_scope();
+            for (param, arg) in func.params.iter().zip(args) {
+                self.environment.define(param.name.clone(), arg, false);
+            }
+            let result = self.execute_block_inner(&func.body);
+            self.environment.pop_scope();
+            return match result? {
+                StmtResult::Normal => Ok(Value::Void),
+                StmtResult::Return(val) => Ok(val),
+            };
+        }
+
+        // 2. Funciones nativas (built-ins)
         if let Some(native_fn) = self.native_functions.get(name) {
             return native_fn(args);
         }
 
-        let func = self
-            .functions
-            .get(name)
-            .cloned()
-            .ok_or_else(|| RuntimeError {
-                message: format!("undefined function '{}'", name),
-                span,
-            })?;
+        // 3. Variable que contiene un Value::Func (primera clase)
+        if let Ok(Value::Func {
+            params,
+            body,
+            captured,
+        }) = self.environment.get(name, span)
+        {
+            return self.call_func_value(params, body, captured, args, span);
+        }
 
-        if args.len() != func.params.len() {
+        Err(RuntimeError {
+            message: format!("undefined function '{}'", name),
+            span,
+        })
+    }
+
+    // Ejecuta un Value::Func con los argumentos dados.
+    // Inyecta primero el entorno capturado (closure) y luego los params
+    // para que los params siempre tengan prioridad.
+    fn call_func_value(
+        &mut self,
+        params: Vec<Param>,
+        body: Block,
+        captured: HashMap<String, Value>,
+        args: Vec<Value>,
+        span: Span,
+    ) -> Result<Value, RuntimeError> {
+        if args.len() != params.len() {
             return Err(RuntimeError {
                 message: format!(
-                    "function '{}' expects {} arguments, got {}",
-                    name,
-                    func.params.len(),
+                    "function expects {} arguments, got {}",
+                    params.len(),
                     args.len()
                 ),
                 span,
             });
         }
-
         self.environment.push_scope();
-
-        for (param, arg) in func.params.iter().zip(args) {
+        // Primero el entorno capturado (closure)
+        for (name, val) in captured {
+            self.environment.define(name, val, false);
+        }
+        // Luego los params (sobreescriben captured si hay colision)
+        for (param, arg) in params.iter().zip(args) {
             self.environment.define(param.name.clone(), arg, false);
         }
-
-        let result = self.execute_block_inner(&func.body);
+        let result = self.execute_block_inner(&body);
         self.environment.pop_scope();
-
         match result? {
             StmtResult::Normal => Ok(Value::Void),
             StmtResult::Return(val) => Ok(val),
+        }
+    }
+
+    // --- Higher-order built-ins (necesitan &mut self para ejecutar Value::Func) ---
+
+    fn builtin_map(&mut self, args: Vec<Value>, span: Span) -> Result<Value, RuntimeError> {
+        if args.len() != 2 {
+            return Err(native_err_arg("map", 2, args.len()));
+        }
+        match (args[0].clone(), args[1].clone()) {
+            (
+                Value::List(items),
+                Value::Func {
+                    params,
+                    body,
+                    captured,
+                },
+            ) => {
+                let mut result = Vec::new();
+                for item in items {
+                    let val = self.call_func_value(
+                        params.clone(),
+                        body.clone(),
+                        captured.clone(),
+                        vec![item],
+                        span,
+                    )?;
+                    result.push(val);
+                }
+                Ok(Value::List(result))
+            }
+            (a, b) => Err(RuntimeError {
+                message: format!(
+                    "'map' expects a list and a function, got '{}' and '{}'",
+                    a.type_name(),
+                    b.type_name()
+                ),
+                span,
+            }),
+        }
+    }
+
+    fn builtin_filter(&mut self, args: Vec<Value>, span: Span) -> Result<Value, RuntimeError> {
+        if args.len() != 2 {
+            return Err(native_err_arg("filter", 2, args.len()));
+        }
+        match (args[0].clone(), args[1].clone()) {
+            (
+                Value::List(items),
+                Value::Func {
+                    params,
+                    body,
+                    captured,
+                },
+            ) => {
+                let mut result = Vec::new();
+                for item in &items {
+                    let val = self.call_func_value(
+                        params.clone(),
+                        body.clone(),
+                        captured.clone(),
+                        vec![item.clone()],
+                        span,
+                    )?;
+                    if val == Value::Bool(true) {
+                        result.push(item.clone());
+                    }
+                }
+                Ok(Value::List(result))
+            }
+            (a, b) => Err(RuntimeError {
+                message: format!(
+                    "'filter' expects a list and a function, got '{}' and '{}'",
+                    a.type_name(),
+                    b.type_name()
+                ),
+                span,
+            }),
+        }
+    }
+
+    fn builtin_reduce(&mut self, args: Vec<Value>, span: Span) -> Result<Value, RuntimeError> {
+        if args.len() != 3 {
+            return Err(native_err_arg("reduce", 3, args.len()));
+        }
+        let initial = args[2].clone();
+        match (args[0].clone(), args[1].clone()) {
+            (Value::List(items), Value::Func { params, body, captured }) => {
+                let mut acc = initial;
+                for item in items {
+                    acc = self.call_func_value(params.clone(), body.clone(), captured.clone(), vec![acc, item], span)?;
+                }
+                Ok(acc)
+            }
+            (a, b) => Err(RuntimeError {
+                message: format!("'reduce' expects a list, a function and an initial value, got '{}', '{}' and '{}'", a.type_name(), b.type_name(), initial.type_name()),
+                span,
+            }),
+        }
+    }
+
+    fn builtin_sort_by(&mut self, args: Vec<Value>, span: Span) -> Result<Value, RuntimeError> {
+        if args.len() != 2 {
+            return Err(native_err_arg("sortBy", 2, args.len()));
+        }
+        match (args[0].clone(), args[1].clone()) {
+            (
+                Value::List(items),
+                Value::Func {
+                    params,
+                    body,
+                    captured,
+                },
+            ) => {
+                // Precalculamos las claves para poder usar &mut self
+                let mut keyed: Vec<(Value, Value)> = Vec::new();
+                for item in &items {
+                    let key = self.call_func_value(
+                        params.clone(),
+                        body.clone(),
+                        captured.clone(),
+                        vec![item.clone()],
+                        span,
+                    )?;
+                    keyed.push((key, item.clone()));
+                }
+                keyed.sort_by(|(k1, _), (k2, _)| {
+                    k1.partial_cmp(k2).unwrap_or(std::cmp::Ordering::Equal)
+                });
+                Ok(Value::List(keyed.into_iter().map(|(_, v)| v).collect()))
+            }
+            (a, b) => Err(RuntimeError {
+                message: format!(
+                    "'sortBy' expects a list and a function, got '{}' and '{}'",
+                    a.type_name(),
+                    b.type_name()
+                ),
+                span,
+            }),
         }
     }
 
@@ -2488,18 +2793,20 @@ fn native_join(args: Vec<Value>) -> Result<Value, RuntimeError> {
             for item in items {
                 match item {
                     Value::Str(s) => str_items.push(s.clone()),
-                    other => return Err(RuntimeError {
-                        message: format!(
+                    other => {
+                        return Err(RuntimeError {
+                            message: format!(
                             "'join' expects a list of strings as first argument, got list of '{}'",
                             other.type_name()
                         ),
-                        span: Span {
-                            line: 0,
-                            column: 0,
-                            start: 0,
-                            end: 0,
-                        },
-                    }),
+                            span: Span {
+                                line: 0,
+                                column: 0,
+                                start: 0,
+                                end: 0,
+                            },
+                        })
+                    }
                 }
             }
             Ok(Value::Str(str_items.join(delim)))
@@ -2507,6 +2814,313 @@ fn native_join(args: Vec<Value>) -> Result<Value, RuntimeError> {
         (a, b) => Err(RuntimeError {
             message: format!(
                 "'join' expects a list and a string, got '{}' and '{}'",
+                a.type_name(),
+                b.type_name()
+            ),
+            span: Span {
+                line: 0,
+                column: 0,
+                start: 0,
+                end: 0,
+            },
+        }),
+    }
+}
+
+fn native_reverse(args: Vec<Value>) -> Result<Value, RuntimeError> {
+    if args.len() != 1 {
+        return Err(native_err_arg("reverse", 1, args.len()));
+    }
+    match &args[0] {
+        Value::Str(s) => Ok(Value::Str(s.chars().rev().collect())),
+        Value::List(items) => {
+            let mut rev_items = items.clone();
+            rev_items.reverse();
+            Ok(Value::List(rev_items))
+        }
+        other => Err(RuntimeError {
+            message: format!(
+                "'reverse' expects a string or a list, got '{}'",
+                other.type_name()
+            ),
+            span: Span {
+                line: 0,
+                column: 0,
+                start: 0,
+                end: 0,
+            },
+        }),
+    }
+}
+
+fn native_slice(args: Vec<Value>) -> Result<Value, RuntimeError> {
+    if args.len() != 3 {
+        return Err(native_err_arg("slice", 3, args.len()));
+    }
+    match (&args[0], &args[1], &args[2]) {
+        (Value::Str(s), Value::Int(start), Value::Int(len)) => {
+            let start = *start as usize;
+            let len = *len as usize;
+            if start >= s.len() {
+                return Ok(Value::Str("".to_string()));
+            }
+            let end = std::cmp::min(start + len, s.len());
+            Ok(Value::Str(s[start..end].to_string()))
+        }
+        (Value::List(items), Value::Int(start), Value::Int(len)) => {
+            let start = *start as usize;
+            let len = *len as usize;
+            if start >= items.len() {
+                return Ok(Value::List(vec![]));
+            }
+            let end = std::cmp::min(start + len, items.len());
+            Ok(Value::List(items[start..end].to_vec()))
+        }
+        (a, b, c) => Err(RuntimeError {
+            message: format!(
+                "'slice' expects a string or list and two ints, got '{}', '{}' and '{}'",
+                a.type_name(),
+                b.type_name(),
+                c.type_name()
+            ),
+            span: Span {
+                line: 0,
+                column: 0,
+                start: 0,
+                end: 0,
+            },
+        }),
+    }
+}
+
+fn native_sort(args: Vec<Value>) -> Result<Value, RuntimeError> {
+    if args.len() != 1 {
+        return Err(native_err_arg("sort", 1, args.len()));
+    }
+    match &args[0] {
+        Value::List(items) => {
+            let mut has_numbers = false;
+            let mut has_strings = false;
+            for item in items {
+                match item {
+                    Value::Int(_) | Value::Float(_) => {
+                        has_numbers = true;
+                    }
+                    Value::Str(_) => {
+                        has_strings = true;
+                    }
+                    other => {
+                        return Err(RuntimeError {
+                            message: format!(
+                                "'sort' only supports lists of numbers or strings, got list of '{}'",
+                                other.type_name()
+                            ),
+                            span: Span {
+                                line: 0,
+                                column: 0,
+                                start: 0,
+                                end: 0,
+                            },
+                        });
+                    }
+                }
+            }
+            if has_numbers && has_strings {
+                return Err(RuntimeError {
+                    message: "'sort' cannot sort lists with mixed types".to_string(),
+                    span: Span {
+                        line: 0,
+                        column: 0,
+                        start: 0,
+                        end: 0,
+                    },
+                });
+            } else if has_numbers {
+                let mut sorted_items = items.clone();
+                sorted_items.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                return Ok(Value::List(sorted_items));
+            } else if has_strings {
+                let mut sorted_items = items.clone();
+                sorted_items.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                return Ok(Value::List(sorted_items));
+            } else {
+                return Ok(Value::List(items.clone()));
+            }
+        }
+        other => Err(RuntimeError {
+            message: format!(
+                "'sort' expects a list as first argument, got '{}'",
+                other.type_name()
+            ),
+            span: Span {
+                line: 0,
+                column: 0,
+                start: 0,
+                end: 0,
+            },
+        }),
+    }
+}
+
+fn native_zip(args: Vec<Value>) -> Result<Value, RuntimeError> {
+    if args.len() != 2 {
+        return Err(native_err_arg("zip", 2, args.len()));
+    }
+    match (&args[0], &args[1]) {
+        (Value::List(list1), Value::List(list2)) => {
+            let len = std::cmp::min(list1.len(), list2.len());
+            let mut zipped = Vec::new();
+            for i in 0..len {
+                zipped.push(Value::List(vec![list1[i].clone(), list2[i].clone()]));
+            }
+            Ok(Value::List(zipped))
+        }
+        (a, b) => Err(RuntimeError {
+            message: format!(
+                "'zip' expects two lists, got '{}' and '{}'",
+                a.type_name(),
+                b.type_name()
+            ),
+            span: Span {
+                line: 0,
+                column: 0,
+                start: 0,
+                end: 0,
+            },
+        }),
+    }
+}
+
+fn native_unzip(args: Vec<Value>) -> Result<Value, RuntimeError> {
+    if args.len() != 1 {
+        return Err(native_err_arg("unzip", 1, args.len()));
+    }
+    match &args[0] {
+        Value::List(pairs) => {
+            let mut list1 = Vec::new();
+            let mut list2 = Vec::new();
+            for pair in pairs {
+                match pair {
+                    Value::List(items) if items.len() == 2 => {
+                        list1.push(items[0].clone());
+                        list2.push(items[1].clone());
+                    }
+                    other => {
+                        return Err(RuntimeError {
+                            message: format!(
+                            "'unzip' expects a list of pairs (lists of length 2), got list of '{}'",
+                            other.type_name()
+                        ),
+                            span: Span {
+                                line: 0,
+                                column: 0,
+                                start: 0,
+                                end: 0,
+                            },
+                        })
+                    }
+                }
+            }
+            Ok(Value::List(vec![Value::List(list1), Value::List(list2)]))
+        }
+        other => Err(RuntimeError {
+            message: format!(
+                "'unzip' expects a list as first argument, got '{}'",
+                other.type_name()
+            ),
+            span: Span {
+                line: 0,
+                column: 0,
+                start: 0,
+                end: 0,
+            },
+        }),
+    }
+}
+
+fn native_first(args: Vec<Value>) -> Result<Value, RuntimeError> {
+    if args.len() != 1 {
+        return Err(native_err_arg("first", 1, args.len()));
+    }
+    match &args[0] {
+        Value::List(items) => {
+            if let Some(first) = items.first() {
+                Ok(first.clone())
+            } else {
+                Err(RuntimeError {
+                    message: "'first' cannot be called on an empty list".to_string(),
+                    span: Span {
+                        line: 0,
+                        column: 0,
+                        start: 0,
+                        end: 0,
+                    },
+                })
+            }
+        }
+        other => Err(RuntimeError {
+            message: format!(
+                "'first' expects a list as first argument, got '{}'",
+                other.type_name()
+            ),
+            span: Span {
+                line: 0,
+                column: 0,
+                start: 0,
+                end: 0,
+            },
+        }),
+    }
+}
+
+fn native_last(args: Vec<Value>) -> Result<Value, RuntimeError> {
+    if args.len() != 1 {
+        return Err(native_err_arg("last", 1, args.len()));
+    }
+    match &args[0] {
+        Value::List(items) => {
+            if let Some(last) = items.last() {
+                Ok(last.clone())
+            } else {
+                Err(RuntimeError {
+                    message: "'last' cannot be called on an empty list".to_string(),
+                    span: Span {
+                        line: 0,
+                        column: 0,
+                        start: 0,
+                        end: 0,
+                    },
+                })
+            }
+        }
+        other => Err(RuntimeError {
+            message: format!(
+                "'last' expects a list as first argument, got '{}'",
+                other.type_name()
+            ),
+            span: Span {
+                line: 0,
+                column: 0,
+                start: 0,
+                end: 0,
+            },
+        }),
+    }
+}
+
+fn native_concat(args: Vec<Value>) -> Result<Value, RuntimeError> {
+    if args.len() != 2 {
+        return Err(native_err_arg("concat", 2, args.len()));
+    }
+    match (&args[0], &args[1]) {
+        (Value::List(list1), Value::List(list2)) => {
+            let mut concatenated = list1.clone();
+            concatenated.extend(list2.clone());
+            Ok(Value::List(concatenated))
+        }
+        (a, b) => Err(RuntimeError {
+            message: format!(
+                "'concatenate' expects two lists, got '{}' and '{}'",
                 a.type_name(),
                 b.type_name()
             ),
