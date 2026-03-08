@@ -73,9 +73,9 @@ fn main() -> void {
     let fact5 = factorial(5);
 
     // typeOf demo
-    print("typeOf(x):", typeOf(x));
-    print("typeOf(pi):", typeOf(pi));
-    print("typeOf(greeting):", typeOf(greeting));
-    print("typeOf(is_awesome):", typeOf(is_awesome));
-    print("typeOf(p1):", typeOf(p1));
+    print(f"typeOf(x): {typeOf(x)}");
+    print(f"typeOf(pi): {typeOf(pi)}");
+    print(f"typeOf(greeting): {typeOf(greeting)}");
+    print(f"typeOf(is_awesome): {typeOf(is_awesome)}");
+    print(f"typeOf(p1): {typeOf(p1)}");
 }
