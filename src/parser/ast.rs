@@ -305,6 +305,19 @@ pub enum Expr {
         span: Span,
     },
 
+    // Funcion anonima (closure / lambda)
+    // |x, y| { return x + y; }
+    // |n|    { return n % 2 == 0; }
+    // || { return 42; }   (cero params)
+    //
+    // params  -> nombres de los parametros (sin anotacion de tipo)
+    // body    -> bloque de codigo; `|x| expr` se desazucara a `|x| { return expr; }`
+    Lambda {
+        params: Vec<String>,
+        body:   Block,
+        span:   Span,
+    },
+
     // #SELECT cols FROM tabla WHERE cond
     // #SELECT SINGLE * FROM users WHERE name == "Bob"
     // #SELECT name, age FROM file("data.csv") WHERE age > 18
@@ -347,6 +360,7 @@ impl Expr {
             | Expr::Grouped { span, .. }
             | Expr::ListLiteral { span, .. }
             | Expr::Index { span, .. }
+            | Expr::Lambda { span, .. }
             | Expr::SqlSelect { span, .. }
             | Expr::SqlInsert { span, .. } => *span,
         }

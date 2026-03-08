@@ -211,10 +211,7 @@ impl Lexer {
                     self.advance();
                     TokenKind::Or
                 } else {
-                    return Err(LexerError {
-                        message: format!("unexpected character '|', did you mean '||'?"),
-                        span: Span { line: start_line, column: start_col, start, end: self.pos },
-                    });
+                    TokenKind::Pipe
                 }
             }
 

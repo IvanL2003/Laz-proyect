@@ -593,6 +593,24 @@ impl Formatter {
                 format!("{}[{}]", self.format_expr(object), self.format_expr(index))
             }
 
+            Expr::Lambda { params, body, .. } => {
+                let params_str = params.join(", ");
+                // Forma compacta: cuerpo de un solo return -> |x| expr
+                if body.statements.len() == 1 {
+                    if let Stmt::Return { value: Some(expr), .. } = &body.statements[0] {
+                        return format!("|{}| {}", params_str, self.format_expr(expr));
+                    }
+                }
+                // Forma bloque: |x| { ... }
+                let stmts: Vec<String> = body.statements.iter().map(|s| {
+                    let mut f = Formatter::new(vec![]);
+                    f.indent_level = self.indent_level + 1;
+                    f.format_statement(s);
+                    f.output
+                }).collect();
+                format!("|{}| {{\n{}{}}}", params_str, stmts.join(""), self.indent())
+            }
+
             Expr::SqlSelect {
                 columns,
                 table_ref,

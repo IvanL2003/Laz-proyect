@@ -894,6 +894,39 @@ impl Parser {
                 };
                 Ok(Expr::ListLiteral { elements, span })
             }
+
+            // Lambda con params: |x, y| expr   |x, y| { block }
+            TokenKind::Pipe => {
+                self.advance(); // consume '|'
+                let mut params = Vec::new();
+                while !self.check(&TokenKind::Pipe) && !self.is_at_end() {
+                    let name_tok = self.advance();
+                    if let TokenKind::Ident(name) = name_tok.kind {
+                        params.push(name);
+                    } else {
+                        return Err(ParseError {
+                            message: format!("expected parameter name, found '{}'", name_tok.kind),
+                            expected: "identifier".to_string(),
+                            found: format!("{}", name_tok.kind),
+                            span: name_tok.span,
+                        });
+                    }
+                    if !self.match_token(&TokenKind::Comma) { break; }
+                }
+                self.expect(&TokenKind::Pipe)?; // consume closing '|'
+                let body = self.parse_lambda_body(token.span)?;
+                let span = Span { start: token.span.start, end: body.span.end, ..token.span };
+                Ok(Expr::Lambda { params, body, span })
+            }
+
+            // Lambda sin params: || expr   || { block }
+            TokenKind::Or => {
+                self.advance(); // consume '||'
+                let body = self.parse_lambda_body(token.span)?;
+                let span = Span { start: token.span.start, end: body.span.end, ..token.span };
+                Ok(Expr::Lambda { params: vec![], body, span })
+            }
+
             _ => Err(ParseError {
                 message: format!("expected expression, found '{}'", token.kind),
                 expected: "expression".to_string(),
@@ -1074,6 +1107,20 @@ impl Parser {
             arms,
             span: match_token.span,
         })
+    }
+
+    // Cuerpo de lambda: `{ block }` o una expresion que se desazucara a `{ return expr; }`
+    fn parse_lambda_body(&mut self, span: Span) -> Result<Block, ParseError> {
+        if self.check(&TokenKind::LeftBrace) {
+            self.parse_block()
+        } else {
+            let expr = self.parse_expression()?;
+            let expr_span = expr.span();
+            Ok(Block {
+                statements: vec![Stmt::Return { value: Some(expr), span: expr_span }],
+                span: Span { start: span.start, end: expr_span.end, ..span },
+            })
+        }
     }
 
     fn parse_pattern(&mut self) -> Result<Pattern, ParseError> {

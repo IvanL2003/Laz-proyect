@@ -137,12 +137,30 @@ impl TypeChecker {
         match expr {
             Expr::FnCall { callee, args, span } => {
                 const BUILTINS: &[(&str, usize)] = &[
-            ("typeOf", 1),
-            ("len", 1), ("push", 2), ("pop", 1),
-            ("toString", 1), ("parseInt", 1), ("toFloat", 1),
-            ("ok", 1), ("err", 1), ("some", 1), ("none", 0),
-            ("unwrap", 1), ("is_ok", 1), ("is_err", 1), ("is_some", 1), ("is_none", 1),
-        ];
+                    // Tipo
+                    ("typeOf", 1),
+                    // Listas
+                    ("len", 1), ("push", 2), ("pop", 1),
+                    ("sort", 1), ("first", 1), ("last", 1),
+                    ("concat", 2), ("zip", 2), ("unzip", 1),
+                    ("reverse", 1), ("slice", 3), ("contains", 2),
+                    ("join", 2), ("range", 2),
+                    // HOFs
+                    ("map", 2), ("filter", 2), ("reduce", 3), ("sortBy", 2),
+                    // Conversión
+                    ("toString", 1), ("parseInt", 1), ("toFloat", 1),
+                    // Strings
+                    ("trim", 1), ("lower", 1), ("upper", 1),
+                    ("replace", 3), ("split", 2), ("substring", 3),
+                    ("startsWith", 2), ("endsWith", 2),
+                    ("indexOf", 2), ("lastIndexOf", 2),
+                    // Math
+                    ("abs", 1), ("sqrt", 1), ("floor", 1), ("ceil", 1),
+                    ("pow", 2), ("powf", 2), ("min", 2), ("max", 2),
+                    // Result / Option
+                    ("ok", 1), ("err", 1), ("some", 1), ("none", 0),
+                    ("unwrap", 1), ("is_ok", 1), ("is_err", 1), ("is_some", 1), ("is_none", 1),
+                ];
                 let builtin = BUILTINS.iter().find(|(name, _)| *name == callee.as_str());
 
                 if let Some(&expected_args) = self.functions.get(callee.as_str()) {
@@ -165,12 +183,9 @@ impl TypeChecker {
                             span: *span,
                         });
                     }
-                } else {
-                    self.errors.push(SemanticError {
-                        message: format!("undefined function '{}'", callee),
-                        span: *span,
-                    });
                 }
+                // Si no se reconoce, podría ser una variable que contiene un Value::Func
+                // (lambda asignada a variable). El runtime lo validará.
                 for arg in args {
                     self.validate_expr(arg);
                 }
@@ -235,6 +250,11 @@ impl TypeChecker {
             Expr::Index { object, index, .. } => {
                 self.validate_expr(object);
                 self.validate_expr(index);
+            }
+            Expr::Lambda { body, .. } => {
+                for stmt in &body.statements {
+                    self.validate_stmt(stmt, true);
+                }
             }
             // Literals and identifiers - nothing to validate at this stage
             _ => {}

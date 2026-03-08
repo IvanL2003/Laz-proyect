@@ -76,6 +76,7 @@ pub enum TokenKind {
     And,
     Or,
     Bang,
+    Pipe, // | (lambda delimiter)
 
     // Assignment
     Equal,
@@ -159,6 +160,7 @@ impl std::fmt::Display for TokenKind {
             TokenKind::And => write!(f, "&&"),
             TokenKind::Or => write!(f, "||"),
             TokenKind::Bang => write!(f, "!"),
+            TokenKind::Pipe => write!(f, "|"),
             TokenKind::Equal => write!(f, "="),
             TokenKind::LeftParen => write!(f, "("),
             TokenKind::RightParen => write!(f, ")"),

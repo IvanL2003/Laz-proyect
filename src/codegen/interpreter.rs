@@ -870,6 +870,25 @@ impl Interpreter {
                 }
             }
 
+            // |x, y| { body }  -->  Value::Func con snapshot del entorno actual (closure)
+            // Los params se almacenan como Param sinteticos (tipo Void, no se usa en runtime)
+            Expr::Lambda { params, body, .. } => {
+                let captured = self.environment.snapshot();
+                let synthetic_params: Vec<Param> = params
+                    .iter()
+                    .map(|name| Param {
+                        name: name.clone(),
+                        type_ann: TypeAnnotation::Void,
+                        span: Span { line: 0, column: 0, start: 0, end: 0 },
+                    })
+                    .collect();
+                Ok(Value::Func {
+                    params:   synthetic_params,
+                    body:     body.clone(),
+                    captured,
+                })
+            }
+
             // Operadores unarios:
             //   UnaryOp::Neg --> -x  (int o float; error si otro tipo)
             //   UnaryOp::Not --> !x  (solo bool; error si otro tipo)
@@ -3410,5 +3429,66 @@ let result = len(arr);
         "#;
         let i = run_ok(src);
         assert!(matches!(get(&i, "result"), Value::Int(3)));
+    }
+
+    // ── Lambdas ───────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_lambda_map() {
+        let i = run_ok("let result = map([1, 2, 3], |x| x * 2);");
+        if let Value::List(items) = get(&i, "result") {
+            assert_eq!(items, vec![Value::Int(2), Value::Int(4), Value::Int(6)]);
+        } else { panic!("expected list"); }
+    }
+
+    #[test]
+    fn test_lambda_filter() {
+        let i = run_ok("let result = filter([1, 2, 3, 4, 5], |x| x % 2 == 0);");
+        if let Value::List(items) = get(&i, "result") {
+            assert_eq!(items, vec![Value::Int(2), Value::Int(4)]);
+        } else { panic!("expected list"); }
+    }
+
+    #[test]
+    fn test_lambda_reduce() {
+        let i = run_ok("let result = reduce([1, 2, 3, 4, 5], |acc, x| acc + x, 0);");
+        assert!(matches!(get(&i, "result"), Value::Int(15)));
+    }
+
+    #[test]
+    fn test_lambda_sort_by() {
+        let i = run_ok("let result = sortBy([3, 1, 4, 1, 5], |x| x);");
+        if let Value::List(items) = get(&i, "result") {
+            assert_eq!(items[0], Value::Int(1));
+            assert_eq!(items[4], Value::Int(5));
+        } else { panic!("expected list"); }
+    }
+
+    #[test]
+    fn test_lambda_closure_capture() {
+        let i = run_ok("let factor = 3; let result = map([1, 2, 3], |x| x * factor);");
+        if let Value::List(items) = get(&i, "result") {
+            assert_eq!(items, vec![Value::Int(3), Value::Int(6), Value::Int(9)]);
+        } else { panic!("expected list"); }
+    }
+
+    #[test]
+    fn test_lambda_block_body() {
+        let i = run_ok(r#"let result = map([1, 2, 3], |x| { return x + 10; });"#);
+        if let Value::List(items) = get(&i, "result") {
+            assert_eq!(items, vec![Value::Int(11), Value::Int(12), Value::Int(13)]);
+        } else { panic!("expected list"); }
+    }
+
+    #[test]
+    fn test_lambda_assigned_to_variable() {
+        let i = run_ok("let double = |x| x * 2; let result = double(5);");
+        assert!(matches!(get(&i, "result"), Value::Int(10)));
+    }
+
+    #[test]
+    fn test_lambda_zero_params() {
+        let i = run_ok("let f = || 42; let result = f();");
+        assert!(matches!(get(&i, "result"), Value::Int(42)));
     }
 }
