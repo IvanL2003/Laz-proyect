@@ -45,6 +45,11 @@ pub enum Value {
         body: Block,
         captured: HashMap<String, Value>,
     },
+    // Color::Red  (variante de un enum user-defined)
+    EnumVariant {
+        enum_name: String,
+        variant: String,
+    },
 }
 
 impl PartialEq for Value {
@@ -76,6 +81,11 @@ impl PartialEq for Value {
             ) => t1 == t2 && f1 == f2,
             // Las funciones no tienen igualdad estructural
             (Value::Func { .. }, Value::Func { .. }) => false,
+            // Enum variants: iguales si mismo enum y mismo variant
+            (
+                Value::EnumVariant { enum_name: e1, variant: v1 },
+                Value::EnumVariant { enum_name: e2, variant: v2 },
+            ) => e1 == e2 && v1 == v2,
             // Tipos distintos → siempre false
             _ => false,
         }
@@ -101,6 +111,7 @@ impl Value {
             Value::None => "none",
             Value::Void => "void",
             Value::Func { .. } => "fn",
+            Value::EnumVariant { enum_name, .. } => enum_name,
         }
     }
     #[allow(dead_code)]
@@ -115,6 +126,7 @@ impl Value {
             Value::Err(_) | Value::None | Value::Void => false,
             Value::StructInstance { .. } => true,
             Value::Func { .. } => true,
+            Value::EnumVariant { .. } => true,
         }
     }
     #[allow(dead_code)]
@@ -179,6 +191,9 @@ impl Value {
             Value::Func { params, .. } => {
                 let names: Vec<&str> = params.iter().map(|p| p.name.as_str()).collect();
                 format!("fn({})", names.join(", "))
+            }
+            Value::EnumVariant { enum_name, variant } => {
+                format!("{}::{}", enum_name, variant)
             }
         }
     }
@@ -303,16 +318,27 @@ enum StmtResult {
     Return(Value),
 }
 
+// Represents the physical data source after resolving a SqlTableRef.
+enum TableSource {
+    Csv(PathBuf, String),     // (file_path, table_name)
+    Sqlite(PathBuf, String),  // (db_path, table_name in sqlite)
+}
+
 // --- Interpreter ---
 
 pub struct Interpreter {
     environment: Environment,
     functions: HashMap<String, FnDecl>,
     structs: HashMap<String, StructDecl>,
-    alias: HashMap<String, String>, // alias -> file path
+    alias: HashMap<String, String>,            // alias -> file path (CSV/file)
+    db_tables: HashMap<String, (PathBuf, String)>, // table_name -> (db_path, table_in_sqlite)
     base_dir: PathBuf,
     native_functions: HashMap<String, fn(Vec<Value>) -> Result<Value, RuntimeError>>,
     imported_files: HashSet<PathBuf>, // para evitar imports circulares
+    // Canal de propagacion del operador ?:
+    // Cuando `expr?` encuentra err/none, guarda el valor aqui y devuelve Void como placeholder.
+    // execute_block_inner lo detecta tras cada statement y emite StmtResult::Return.
+    try_return: Option<Value>,
 }
 
 impl Interpreter {
@@ -381,14 +407,16 @@ impl Interpreter {
             functions: HashMap::new(),
             structs: HashMap::new(),
             alias: HashMap::new(),
+            db_tables: HashMap::new(),
             base_dir,
             native_functions,
             imported_files: HashSet::new(),
+            try_return: None,
         }
     }
 
     pub fn run(&mut self, program: &Program) -> Result<(), RuntimeError> {
-        // Register all functions, structs, file connections, and process imports
+        // Register all functions, structs, enums, file connections, and process imports
         for decl in &program.declarations {
             match decl {
                 Declaration::Function(f) => {
@@ -397,8 +425,12 @@ impl Interpreter {
                 Declaration::Struct(s) => {
                     self.structs.insert(s.name.clone(), s.clone());
                 }
+                Declaration::Enum(_) => {
+                    // Enums are structural: no runtime registration needed.
+                    // Variants are created as Value::EnumVariant when evaluated.
+                }
                 Declaration::Connect(c) => {
-                    self.alias.insert(c.alias.clone(), c.file_path.clone());
+                    self.register_connect(c);
                 }
                 Declaration::Import { path, span } => {
                     self.process_import(path, *span)?;
@@ -456,7 +488,7 @@ impl Interpreter {
             span,
         })?;
 
-        // Solo registrar funciones, structs y connects — no ejecutar statements
+        // Solo registrar funciones, structs, enums y connects — no ejecutar statements
         for decl in &program.declarations {
             match decl {
                 Declaration::Function(f) => {
@@ -465,8 +497,9 @@ impl Interpreter {
                 Declaration::Struct(s) => {
                     self.structs.insert(s.name.clone(), s.clone());
                 }
+                Declaration::Enum(_) => {}
                 Declaration::Connect(c) => {
-                    self.alias.insert(c.alias.clone(), c.file_path.clone());
+                    self.register_connect(c);
                 }
                 Declaration::Import {
                     path: inner_path,
@@ -482,6 +515,26 @@ impl Interpreter {
         Ok(())
     }
 
+    // Registers a ConnectDecl: CSV/file/api go into self.alias; db goes into self.db_tables.
+    fn register_connect(&mut self, c: &crate::parser::ast::ConnectDecl) {
+        use crate::lexer::ConnectType;
+        match c.connect_type {
+            ConnectType::Db => {
+                let db_path = self.base_dir.join(&c.file_path);
+                for mapping in &c.mappings {
+                    // table_name is the alias used in SQL; it maps to (db_path, actual_table)
+                    self.db_tables.insert(
+                        mapping.table_name.clone(),
+                        (db_path.clone(), mapping.table_name.clone()),
+                    );
+                }
+            }
+            _ => {
+                self.alias.insert(c.alias.clone(), c.file_path.clone());
+            }
+        }
+    }
+
     fn execute_block(&mut self, block: &Block) -> Result<StmtResult, RuntimeError> {
         self.environment.push_scope();
         let result = self.execute_block_inner(block);
@@ -492,7 +545,12 @@ impl Interpreter {
     fn execute_block_inner(&mut self, block: &Block) -> Result<StmtResult, RuntimeError> {
         for stmt in &block.statements {
             match self.execute_stmt(stmt)? {
-                StmtResult::Normal => {}
+                StmtResult::Normal => {
+                    // Check if a ? operator triggered early return propagation
+                    if let Some(val) = self.try_return.take() {
+                        return Ok(StmtResult::Return(val));
+                    }
+                }
                 ret @ StmtResult::Return(_) => return Ok(ret),
             }
         }
@@ -782,6 +840,10 @@ impl Interpreter {
             (Pattern::None, Value::None) => Some(vec![]),
             (Pattern::Wildcard, _) => Some(vec![]),
             (Pattern::Ident(name), v) => Some(vec![(name.clone(), v.clone())]),
+            (
+                Pattern::EnumVariant { enum_name: pe, variant: pv },
+                Value::EnumVariant { enum_name: ve, variant: vv },
+            ) if pe == ve && pv == vv => Some(vec![]),
             _ => None,
         }
     }
@@ -794,6 +856,20 @@ impl Interpreter {
             Expr::FloatLiteral { value, .. } => Ok(Value::Float(*value)),
             // "hello"  -->  Value::Str(String)
             Expr::StringLiteral { value, .. } => Ok(Value::Str(value.clone())),
+            // f"Hola {name}" --> concatena literales y valores evaluados
+            Expr::FString { parts, .. } => {
+                let mut result = String::new();
+                for part in parts {
+                    match part {
+                        crate::parser::ast::AstFStringPart::Literal(s) => result.push_str(s),
+                        crate::parser::ast::AstFStringPart::Expr(expr) => {
+                            let val = self.evaluate_expr(expr)?;
+                            result.push_str(&val.to_display_string());
+                        }
+                    }
+                }
+                Ok(Value::Str(result))
+            }
             // true / false  -->  Value::Bool(bool)
             Expr::BoolLiteral { value, .. } => Ok(Value::Bool(*value)),
 
@@ -1063,29 +1139,63 @@ impl Interpreter {
                 values,
                 span,
             } => self.execute_sql_insert(table_ref, values, *span),
+
+            // expr?
+            // Result: ok(v)? → v | err(e)? → set try_return=err(e), return Void
+            // Option: some(v)? → v | none? → set try_return=none, return Void
+            Expr::Try { expr, span } => {
+                let val = self.evaluate_expr(expr)?;
+                match val {
+                    Value::Ok(inner)   => Ok(*inner),
+                    Value::Some(inner) => Ok(*inner),
+                    Value::Err(_) | Value::None => {
+                        self.try_return = Some(val);
+                        Ok(Value::Void)
+                    }
+                    other => Err(RuntimeError {
+                        message: format!(
+                            "? requires Result or Option, got '{}'",
+                            other.type_name()
+                        ),
+                        span: *span,
+                    }),
+                }
+            }
+
+            // Color::Red  -->  Value::EnumVariant { enum_name: "Color", variant: "Red" }
+            Expr::EnumVariant { enum_name, variant, .. } => {
+                Ok(Value::EnumVariant {
+                    enum_name: enum_name.clone(),
+                    variant: variant.clone(),
+                })
+            }
         }
     }
 
     // --- SQL Execution ---
 
-    // Resuelve un SqlTableRef a (PathBuf, nombre_tabla):
-    //   Alias("users")       -->  busca en self.alias["users"] --> base_dir + "users.csv"
-    //   Inline("data.csv")   -->  usa la ruta directamente      --> base_dir + "data.csv"
-    fn resolve_file_path(
+    // Represents the physical source for a SQL table reference.
+    //   Csv(path, table_name)     -- a CSV/file connected via `connect file`
+    //   Sqlite(db_path, table)    -- a SQLite table connected via `connect db`
+    fn resolve_table_source(
         &self,
         table_ref: &SqlTableRef,
         span: Span,
-    ) -> Result<(PathBuf, String), RuntimeError> {
+    ) -> Result<TableSource, RuntimeError> {
         match table_ref {
             SqlTableRef::Alias(alias) => {
-                if let Some(file_path) = self.alias.get(alias) {
-                    Ok((self.base_dir.join(file_path), alias.clone()))
-                } else {
-                    return Err(RuntimeError {
-                        message: format!("unknown table alias '{}'", alias),
-                        span,
-                    });
+                // Check SQLite db_tables first
+                if let Some((db_path, table_name)) = self.db_tables.get(alias) {
+                    return Ok(TableSource::Sqlite(db_path.clone(), table_name.clone()));
                 }
+                // Fall back to CSV alias
+                if let Some(file_path) = self.alias.get(alias) {
+                    return Ok(TableSource::Csv(self.base_dir.join(file_path), alias.clone()));
+                }
+                Err(RuntimeError {
+                    message: format!("unknown table alias '{}'", alias),
+                    span,
+                })
             }
             SqlTableRef::Inline(file_path) => {
                 let path = std::path::Path::new(file_path);
@@ -1094,7 +1204,7 @@ impl Interpreter {
                     .and_then(|s| s.to_str())
                     .unwrap_or(file_path)
                     .to_string();
-                Ok((self.base_dir.join(file_path), name))
+                Ok(TableSource::Csv(self.base_dir.join(file_path), name))
             }
         }
     }
@@ -1183,15 +1293,29 @@ impl Interpreter {
         single: bool,
         span: Span,
     ) -> Result<Value, RuntimeError> {
-        let (file_path, table_name) = self.resolve_file_path(table_ref, span)?;
-        let table =
-            DataTable::from_file(&file_path).map_err(|e| RuntimeError { message: e, span })?;
+        let source = self.resolve_table_source(table_ref, span)?;
+
+        let (headers, rows, table_name) = match source {
+            TableSource::Csv(file_path, tname) => {
+                let table = DataTable::from_file(&file_path)
+                    .map_err(|e| RuntimeError { message: e, span })?;
+                let rows = table.rows.clone();
+                let headers = table.headers.clone();
+                (headers, rows, tname)
+            }
+            TableSource::Sqlite(db_path, tname) => {
+                let db_str = db_path.to_string_lossy().into_owned();
+                let (headers, rows) = crate::utils::sqlite::load_table_rows(&db_str, &tname)
+                    .map_err(|e| RuntimeError { message: e, span })?;
+                (headers, rows, tname)
+            }
+        };
 
         // Validate columns exist
         let use_all = columns.len() == 1 && columns[0] == "*";
         if !use_all {
             for col in columns {
-                if table.column_index(col).is_none() {
+                if !headers.contains(col) {
                     return Err(RuntimeError {
                         message: format!("column '{}' not found in table '{}'", col, table_name),
                         span,
@@ -1200,19 +1324,19 @@ impl Interpreter {
             }
         }
 
-        // Busca un struct declarado cuyo fields coincidan con las columnas seleccionadas
+        // Find a matching struct or use table_name as fallback
         let struct_name = self
-            .find_matching_struct(&table.headers, columns)
+            .find_matching_struct(&headers, columns)
             .unwrap_or_else(|| table_name.clone());
 
         let mut results = Vec::new();
 
-        for row_idx in 0..table.rows.len() {
+        for row in &rows {
             let matches = if let Some(cond) = condition {
-                // Scope temporal con los valores de la fila como variables para evaluar WHERE
+                // Temporary scope with row values as variables for WHERE evaluation
                 self.environment.push_scope();
-                for (i, header) in table.headers.iter().enumerate() {
-                    let val = Self::cell_to_value(&table.rows[row_idx][i]);
+                for (i, header) in headers.iter().enumerate() {
+                    let val = Self::cell_to_value(&row[i]);
                     self.environment.define(header.clone(), val, false);
                 }
                 let result = self.evaluate_expr(cond);
@@ -1231,16 +1355,11 @@ impl Interpreter {
                     }
                 }
             } else {
-                true // No WHERE = todas las filas coinciden
+                true
             };
 
             if matches {
-                let row_value = Self::row_to_struct(
-                    &struct_name,
-                    &table.headers,
-                    &table.rows[row_idx],
-                    columns,
-                );
+                let row_value = Self::row_to_struct(&struct_name, &headers, row, columns);
                 if single {
                     return Ok(row_value);
                 }
@@ -1264,27 +1383,15 @@ impl Interpreter {
         value_exprs: &[Expr],
         span: Span,
     ) -> Result<Value, RuntimeError> {
-        let (file_path, _table_name) = self.resolve_file_path(table_ref, span)?;
-
-        // Read existing table
-        let mut table = if file_path.exists() {
-            DataTable::from_file(&file_path).map_err(|e| RuntimeError { message: e, span })?
-        } else {
-            return Err(RuntimeError {
-                message: format!("file '{}' does not exist", file_path.display()),
-                span,
-            });
-        };
-
-        // Evaluate values
+        // Evaluate value expressions first
         let mut row_values = Vec::new();
         for expr in value_exprs {
             let val = self.evaluate_expr(expr)?;
-            let s = match val {
+            let s = match &val {
                 Value::Int(v) => v.to_string(),
                 Value::Float(v) => v.to_string(),
                 Value::Bool(v) => v.to_string(),
-                Value::Str(v) => v,
+                Value::Str(v) => v.clone(),
                 _ => {
                     return Err(RuntimeError {
                         message: format!("cannot insert value of type '{}'", val.type_name()),
@@ -1295,14 +1402,35 @@ impl Interpreter {
             row_values.push(s);
         }
 
-        // Append and save
-        if let Err(e) = table.append_row(&row_values) {
-            return Err(RuntimeError { message: e, span });
-        }
+        let source = self.resolve_table_source(table_ref, span)?;
 
-        match table.save_to_file(&file_path) {
-            Ok(()) => Ok(Value::Bool(true)),
-            Err(e) => Err(RuntimeError { message: e, span }),
+        match source {
+            TableSource::Sqlite(db_path, table_name) => {
+                let db_str = db_path.to_string_lossy().into_owned();
+                crate::utils::sqlite::insert_row(&db_str, &table_name, &row_values)
+                    .map_err(|e| RuntimeError { message: e, span })?;
+                Ok(Value::Bool(true))
+            }
+            TableSource::Csv(file_path, _) => {
+                let mut table = if file_path.exists() {
+                    DataTable::from_file(&file_path)
+                        .map_err(|e| RuntimeError { message: e, span })?
+                } else {
+                    return Err(RuntimeError {
+                        message: format!("file '{}' does not exist", file_path.display()),
+                        span,
+                    });
+                };
+
+                if let Err(e) = table.append_row(&row_values) {
+                    return Err(RuntimeError { message: e, span });
+                }
+
+                match table.save_to_file(&file_path) {
+                    Ok(()) => Ok(Value::Bool(true)),
+                    Err(e) => Err(RuntimeError { message: e, span }),
+                }
+            }
         }
     }
 
@@ -3165,7 +3293,10 @@ mod integration_tests {
     fn run_ok(src: &str) -> Interpreter {
         let tokens = Lexer::new(src).tokenize().expect("lex failed");
         let program = Parser::new(tokens).parse().expect("parse failed");
-        TypeChecker::check(&program).expect("type check failed");
+        // Warnings are non-fatal; only errors fail the test
+        if let Err(errors) = TypeChecker::check(&program, std::path::Path::new(".")) {
+            panic!("type check failed: {:?}", errors);
+        }
         let mut interp = Interpreter::new(PathBuf::from("."));
         interp.run(&program).expect("runtime failed");
         interp
@@ -3175,7 +3306,7 @@ mod integration_tests {
         let tokens = Lexer::new(src).tokenize().expect("lex failed");
         let program = Parser::new(tokens).parse().expect("parse failed");
         // type check may pass (runtime error only)
-        let _ = TypeChecker::check(&program);
+        let _ = TypeChecker::check(&program, std::path::Path::new("."));
         let mut interp = Interpreter::new(PathBuf::from("."));
         interp.run(&program).expect_err("expected runtime error")
     }
@@ -3490,5 +3621,326 @@ let result = len(arr);
     fn test_lambda_zero_params() {
         let i = run_ok("let f = || 42; let result = f();");
         assert!(matches!(get(&i, "result"), Value::Int(42)));
+    }
+
+    // ── Operador ? ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_try_unwraps_ok() {
+        // ok(v)? devuelve v directamente
+        let src = r#"
+fn get_value() -> int {
+    let r = ok(42);
+    let v = r?;
+    return v;
+}
+let result = get_value();
+"#;
+        let i = run_ok(src);
+        assert!(matches!(get(&i, "result"), Value::Int(42)));
+    }
+
+    #[test]
+    fn test_try_propagates_err() {
+        // err(e)? sale de la funcion devolviendo err(e)
+        let src = r#"
+fn might_fail() -> Result<int, string> {
+    let r = err("oops");
+    let v = r?;
+    return ok(v + 1);
+}
+let result = might_fail();
+"#;
+        let i = run_ok(src);
+        assert!(matches!(get(&i, "result"), Value::Err(_)));
+        if let Value::Err(inner) = get(&i, "result") {
+            assert!(matches!(*inner, Value::Str(ref s) if s == "oops"));
+        }
+    }
+
+    #[test]
+    fn test_try_unwraps_some() {
+        // some(v)? devuelve v
+        let src = r#"
+fn get_opt() -> int {
+    let o = some(7);
+    let v = o?;
+    return v;
+}
+let result = get_opt();
+"#;
+        let i = run_ok(src);
+        assert!(matches!(get(&i, "result"), Value::Int(7)));
+    }
+
+    #[test]
+    fn test_try_propagates_none() {
+        // none? sale de la funcion devolviendo none
+        let src = r#"
+fn might_none() -> Option<int> {
+    let o = none();
+    let v = o?;
+    return some(v + 1);
+}
+let result = might_none();
+"#;
+        let i = run_ok(src);
+        assert!(matches!(get(&i, "result"), Value::None));
+    }
+
+    #[test]
+    fn test_try_inline_on_call() {
+        // ? sobre el resultado de una llamada directa
+        let src = r#"
+fn safe_div(a: int, b: int) -> Result<int, string> {
+    if b == 0 {
+        return err("div by zero");
+    }
+    return ok(a / b);
+}
+fn compute() -> Result<int, string> {
+    let v = safe_div(10, 2)?;
+    return ok(v * 3);
+}
+let result = compute();
+"#;
+        let i = run_ok(src);
+        if let Value::Ok(inner) = get(&i, "result") {
+            assert!(matches!(*inner, Value::Int(15)));
+        } else {
+            panic!("expected ok(15)");
+        }
+    }
+
+    // ── F-strings ─────────────────────────────────────────────────────────────
+
+    fn run_warn(src: &str) -> Vec<crate::utils::error::SemanticWarning> {
+        let tokens = Lexer::new(src).tokenize().expect("lex failed");
+        let program = Parser::new(tokens).parse().expect("parse failed");
+        match TypeChecker::check(&program, std::path::Path::new(".")) {
+            Ok(warnings) => warnings,
+            Err(errors) => panic!("type check failed: {:?}", errors),
+        }
+    }
+
+    #[test]
+    fn test_fstring_plain_literal() {
+        // f-string sin interpolaciones → igual que un string normal
+        let i = run_ok(r#"let result = f"hello world";"#);
+        assert!(matches!(get(&i, "result"), Value::Str(ref s) if s == "hello world"));
+    }
+
+    #[test]
+    fn test_fstring_single_var() {
+        // f"Hola {name}" con variable entera
+        let i = run_ok(r#"let name = "mundo"; let result = f"Hola {name}";"#);
+        assert!(matches!(get(&i, "result"), Value::Str(ref s) if s == "Hola mundo"));
+    }
+
+    #[test]
+    fn test_fstring_int_interpolation() {
+        // Interpolación de int → se convierte a string
+        let i = run_ok(r#"let x = 42; let result = f"valor: {x}";"#);
+        assert!(matches!(get(&i, "result"), Value::Str(ref s) if s == "valor: 42"));
+    }
+
+    #[test]
+    fn test_fstring_float_interpolation() {
+        // Interpolación de float
+        let i = run_ok(r#"let pi = 3.14; let result = f"pi es {pi}";"#);
+        assert!(matches!(get(&i, "result"), Value::Str(ref s) if s == "pi es 3.14"));
+    }
+
+    #[test]
+    fn test_fstring_bool_interpolation() {
+        let i = run_ok(r#"let ok = true; let result = f"es: {ok}";"#);
+        assert!(matches!(get(&i, "result"), Value::Str(ref s) if s == "es: true"));
+    }
+
+    #[test]
+    fn test_fstring_expression() {
+        // Expresión aritmética dentro de {}
+        let i = run_ok(r#"let a = 3; let b = 4; let result = f"suma: {a + b}";"#);
+        assert!(matches!(get(&i, "result"), Value::Str(ref s) if s == "suma: 7"));
+    }
+
+    #[test]
+    fn test_fstring_multiple_parts() {
+        // Varios {expr} en el mismo f-string
+        let i = run_ok(r#"let x = 1; let y = 2; let result = f"{x} + {y} = {x + y}";"#);
+        assert!(matches!(get(&i, "result"), Value::Str(ref s) if s == "1 + 2 = 3"));
+    }
+
+    #[test]
+    fn test_fstring_function_call_in_expr() {
+        // Llamada a función dentro de {}
+        let src = r#"
+fn double(n: int) -> int { return n * 2; }
+let result = f"doble de 5 es {double(5)}";
+"#;
+        let i = run_ok(src);
+        assert!(matches!(get(&i, "result"), Value::Str(ref s) if s == "doble de 5 es 10"));
+    }
+
+    // ── User-defined Enums ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_enum_variant_value() {
+        // Color::Red produce un Value::EnumVariant
+        let src = r#"
+enum Color { Red, Green, Blue }
+let result = Color::Red;
+"#;
+        let i = run_ok(src);
+        if let Value::EnumVariant { enum_name, variant } = get(&i, "result") {
+            assert_eq!(enum_name, "Color");
+            assert_eq!(variant, "Red");
+        } else {
+            panic!("expected EnumVariant");
+        }
+    }
+
+    #[test]
+    fn test_enum_display() {
+        // to_display_string() produce "Color::Red"
+        let src = r#"
+enum Color { Red, Green, Blue }
+let result = Color::Green;
+"#;
+        let i = run_ok(src);
+        assert_eq!(get(&i, "result").to_display_string(), "Color::Green");
+    }
+
+    #[test]
+    fn test_enum_match_arm() {
+        // match sobre enum variant
+        let src = r#"
+enum Dir { North, South, East, West }
+let d = Dir::South;
+let mut result = 0;
+match d {
+    Dir::North => { result = 1; }
+    Dir::South => { result = 2; }
+    Dir::East  => { result = 3; }
+    _          => { result = 4; }
+}
+"#;
+        let i = run_ok(src);
+        assert!(matches!(get(&i, "result"), Value::Int(2)));
+    }
+
+    #[test]
+    fn test_enum_equality() {
+        // Dos variantes del mismo enum son iguales si tienen el mismo nombre
+        let src = r#"
+enum Status { Active, Inactive }
+let a = Status::Active;
+let b = Status::Active;
+let result = a == b;
+"#;
+        let i = run_ok(src);
+        assert!(matches!(get(&i, "result"), Value::Bool(true)));
+    }
+
+    #[test]
+    fn test_enum_inequality() {
+        let src = r#"
+enum Status { Active, Inactive }
+let a = Status::Active;
+let b = Status::Inactive;
+let result = a == b;
+"#;
+        let i = run_ok(src);
+        assert!(matches!(get(&i, "result"), Value::Bool(false)));
+    }
+
+    #[test]
+    fn test_enum_in_function() {
+        // Función que recibe y devuelve enum variant
+        let src = r#"
+enum Light { Red, Yellow, Green }
+fn next_light(l: Light) -> Light {
+    match l {
+        Light::Red    => { return Light::Green; }
+        Light::Green  => { return Light::Yellow; }
+        _             => { return Light::Red; }
+    }
+}
+let result = next_light(Light::Red);
+"#;
+        let i = run_ok(src);
+        if let Value::EnumVariant { variant, .. } = get(&i, "result") {
+            assert_eq!(variant, "Green");
+        } else {
+            panic!("expected EnumVariant");
+        }
+    }
+
+    #[test]
+    fn test_enum_in_list() {
+        // Lista de enum variants
+        let src = r#"
+enum Color { Red, Green, Blue }
+let colors = [Color::Red, Color::Green, Color::Blue];
+let result = len(colors);
+"#;
+        let i = run_ok(src);
+        assert!(matches!(get(&i, "result"), Value::Int(3)));
+    }
+
+    // ── Match wildcard warning ────────────────────────────────────────────────
+
+    #[test]
+    fn test_match_wildcard_no_warning_with_wildcard() {
+        // Con _ no debe haber warning
+        let src = r#"
+fn get() -> Result<int, string> { return ok(1); }
+let r = get();
+match r {
+    ok(v) => { let a = v; }
+    _ => { let a = 0; }
+}
+"#;
+        let warnings = run_warn(src);
+        assert!(
+            warnings.iter().all(|w| !w.message.contains("wildcard") && !w.message.contains("catch-all")),
+            "unexpected wildcard warning: {:?}", warnings
+        );
+    }
+
+    #[test]
+    fn test_match_wildcard_no_warning_with_ident_catch_all() {
+        // Con un ident como catch-all tampoco debe haber warning
+        let src = r#"
+fn get() -> Result<int, string> { return ok(1); }
+let r = get();
+match r {
+    ok(v) => { let a = v; }
+    other => { let a = 0; }
+}
+"#;
+        let warnings = run_warn(src);
+        assert!(
+            warnings.iter().all(|w| !w.message.contains("wildcard") && !w.message.contains("catch-all")),
+            "unexpected wildcard warning: {:?}", warnings
+        );
+    }
+
+    #[test]
+    fn test_match_wildcard_warning_without_wildcard() {
+        // Sin _ ni catch-all debe emitir un warning
+        let src = r#"
+fn get() -> Result<int, string> { return ok(1); }
+let r = get();
+match r {
+    ok(v) => { let a = v; }
+    err(e) => { let a = 0; }
+}
+"#;
+        let warnings = run_warn(src);
+        assert!(
+            warnings.iter().any(|w| w.message.contains("wildcard") || w.message.contains("catch-all")),
+            "expected wildcard warning but got: {:?}", warnings
+        );
     }
 }

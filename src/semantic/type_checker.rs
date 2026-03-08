@@ -1,32 +1,40 @@
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
+use crate::lexer::ConnectType;
 use crate::parser::ast::*;
-use crate::utils::error::SemanticError;
+use crate::utils::error::{SemanticError, SemanticWarning};
 
 pub struct TypeChecker {
-    functions: HashMap<String, usize>, // name -> param count
+    functions: HashMap<String, usize>,     // name -> param count
     structs: HashMap<String, Vec<String>>, // name -> field names
+    enums: HashMap<String, Vec<String>>,   // name -> variant names
     errors: Vec<SemanticError>,
+    warnings: Vec<SemanticWarning>,
 }
 
 impl TypeChecker {
-    pub fn check(program: &Program) -> Result<(), Vec<SemanticError>> {
+    /// `base_dir` is needed to resolve relative SQLite paths in `connect db`.
+    /// Returns Ok(warnings) on success, Err(errors) on failure.
+    pub fn check(program: &Program, base_dir: &Path) -> Result<Vec<SemanticWarning>, Vec<SemanticError>> {
         let mut checker = TypeChecker {
             functions: HashMap::new(),
             structs: HashMap::new(),
+            enums: HashMap::new(),
             errors: Vec::new(),
+            warnings: Vec::new(),
         };
 
-        checker.collect_declarations(program);
+        checker.collect_declarations(program, base_dir);
         checker.validate_program(program);
 
         if checker.errors.is_empty() {
-            Ok(())
+            Ok(checker.warnings)
         } else {
             Err(checker.errors)
         }
     }
 
-    fn collect_declarations(&mut self, program: &Program) {
+    fn collect_declarations(&mut self, program: &Program, base_dir: &Path) {
         let mut seen_fns = HashSet::new();
         let mut seen_structs = HashSet::new();
 
@@ -51,7 +59,32 @@ impl TypeChecker {
                     let field_names: Vec<String> = s.fields.iter().map(|f| f.name.clone()).collect();
                     self.structs.insert(s.name.clone(), field_names);
                 }
-                Declaration::Connect(_) => {}
+                Declaration::Enum(e) => {
+                    self.enums.insert(e.name.clone(), e.variants.clone());
+                }
+                Declaration::Connect(c) => {
+                    // Pre-pass for `connect db`: read SQLite schema and register structs
+                    // so the type checker knows their fields without the user declaring them.
+                    if matches!(c.connect_type, ConnectType::Db) && !c.mappings.is_empty() {
+                        let db_path = base_dir.join(&c.file_path);
+                        let db_path_str = db_path.to_string_lossy();
+                        match crate::utils::sqlite::read_schema(&db_path_str) {
+                            Ok(schema) => {
+                                for mapping in &c.mappings {
+                                    if let Some(cols) = schema.get(&mapping.table_name) {
+                                        let field_names: Vec<String> =
+                                            cols.iter().map(|(name, _)| name.clone()).collect();
+                                        self.structs.insert(mapping.struct_name.clone(), field_names);
+                                    }
+                                }
+                            }
+                            Err(_) => {
+                                // DB file not found at analysis time (e.g. tests without .db files).
+                                // Runtime will report a proper error when the DB is opened.
+                            }
+                        }
+                    }
+                }
                 Declaration::Statement(_) => {}
                 Declaration::Import { .. } => {}
             }
@@ -63,6 +96,7 @@ impl TypeChecker {
             match decl {
                 Declaration::Function(f) => self.validate_block(&f.body, true),
                 Declaration::Struct(_) => {}
+                Declaration::Enum(_) => {}
                 Declaration::Connect(_) => {}
                 Declaration::Statement(stmt) => self.validate_stmt(stmt, false),
                 Declaration::Import { .. } => {} // el interprete maneja la carga
@@ -124,8 +158,18 @@ impl TypeChecker {
             Stmt::Expression { expr, .. } => {
                 self.validate_expr(expr);
             }
-            Stmt::Match { subject, arms, .. } => {
+            Stmt::Match { subject, arms, span } => {
                 self.validate_expr(subject);
+                // Warn if no catch-all arm (Wildcard '_' or named binding like `x`)
+                let has_catchall = arms.iter().any(|arm| {
+                    matches!(arm.pattern, Pattern::Wildcard | Pattern::Ident(_))
+                });
+                if !has_catchall {
+                    self.warnings.push(SemanticWarning {
+                        message: "match has no wildcard arm '_'; unmatched values will panic at runtime".to_string(),
+                        span: *span,
+                    });
+                }
                 for arm in arms {
                     self.validate_block(&arm.body, in_function);
                 }
@@ -254,6 +298,31 @@ impl TypeChecker {
             Expr::Lambda { body, .. } => {
                 for stmt in &body.statements {
                     self.validate_stmt(stmt, true);
+                }
+            }
+            Expr::Try { expr, .. } => {
+                self.validate_expr(expr);
+            }
+            Expr::FString { parts, .. } => {
+                for part in parts {
+                    if let AstFStringPart::Expr(expr) = part {
+                        self.validate_expr(expr);
+                    }
+                }
+            }
+            Expr::EnumVariant { enum_name, variant, span } => {
+                if let Some(variants) = self.enums.get(enum_name) {
+                    if !variants.contains(variant) {
+                        self.errors.push(SemanticError {
+                            message: format!("enum '{}' has no variant '{}'", enum_name, variant),
+                            span: *span,
+                        });
+                    }
+                } else {
+                    self.errors.push(SemanticError {
+                        message: format!("undefined enum '{}'", enum_name),
+                        span: *span,
+                    });
                 }
             }
             // Literals and identifiers - nothing to validate at this stage

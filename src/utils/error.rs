@@ -28,6 +28,34 @@ pub struct SemanticError {
     pub span: Span,
 }
 
+/// Non-fatal warning: code is valid but likely unintentional.
+#[derive(Debug, Clone)]
+pub struct SemanticWarning {
+    pub message: String,
+    pub span: Span,
+}
+
+pub fn format_warning(w: &SemanticWarning, source: &str, filename: &str) -> String {
+    let lines: Vec<&str> = source.lines().collect();
+    let line_str = if w.span.line > 0 && w.span.line <= lines.len() {
+        lines[w.span.line - 1]
+    } else {
+        ""
+    };
+    let pad = " ".repeat(w.span.line.to_string().len());
+    let caret_count = if w.span.end > w.span.start { w.span.end - w.span.start } else { 1 };
+    let carets = "^".repeat(caret_count);
+    let caret_pad = " ".repeat(w.span.column.saturating_sub(1));
+    format!(
+        "warning[W001]: {}\n {}--> {}:{}:{}\n {} |\n{} | {}\n {} | {}{}\n",
+        w.message,
+        pad, filename, w.span.line, w.span.column,
+        pad,
+        w.span.line, line_str,
+        pad, caret_pad, carets,
+    )
+}
+
 #[derive(Debug, Clone)]
 pub struct RuntimeError {
     pub message: String,

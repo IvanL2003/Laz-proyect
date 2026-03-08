@@ -1,4 +1,4 @@
-use crate::lexer::{ConnectType, Span, Token, TokenKind};
+use crate::lexer::{token::FStringPart, ConnectType, Lexer, Span, Token, TokenKind};
 use crate::parser::ast::*;
 use crate::utils::error::ParseError;
 
@@ -94,6 +94,7 @@ impl Parser {
         match self.peek_kind() {
             TokenKind::Fn => Ok(Declaration::Function(self.parse_fn_decl()?)),
             TokenKind::Struct => Ok(Declaration::Struct(self.parse_struct_decl()?)),
+            TokenKind::Enum => Ok(Declaration::Enum(self.parse_enum_decl()?)),
             TokenKind::Connect => Ok(Declaration::Connect(self.parse_connect()?)),
             TokenKind::Import => {
                 let import_token = self.advance(); // consume 'import'
@@ -169,12 +170,39 @@ impl Parser {
 
         self.expect(&TokenKind::As)?; // expect 'as'
         let (alias, _) = self.expect_ident()?; // alias name
+
+        // Optional mapping block for `connect db`: { User from users, Product from products }
+        let mut mappings = Vec::new();
+        if matches!(connect_type, ConnectType::Db) && self.check(&TokenKind::LeftBrace) {
+            self.advance(); // consume '{'
+            while !self.check(&TokenKind::RightBrace) && !self.is_at_end() {
+                let (struct_name, _) = self.expect_ident()?; // e.g. User
+                // 'from' is lexed as Ident("from") since SQL keywords are uppercase
+                match self.peek_kind() {
+                    TokenKind::Ident(s) if s == "from" => { self.advance(); }
+                    _ => return Err(ParseError {
+                        message: format!("expected 'from', found '{}'", self.peek_kind()),
+                        expected: "from".to_string(),
+                        found: format!("{}", self.peek_kind()),
+                        span: self.peek().span,
+                    }),
+                }
+                let (table_name, _) = self.expect_ident()?; // e.g. users
+                mappings.push(DbMapping { struct_name, table_name });
+                if !self.match_token(&TokenKind::Comma) {
+                    break;
+                }
+            }
+            self.expect(&TokenKind::RightBrace)?;
+        }
+
         self.expect(&TokenKind::Semicolon)?;
 
         Ok(ConnectDecl {
             connect_type,
             file_path,
             alias,
+            mappings,
             span: connect_token.span,
         })
     }
@@ -246,6 +274,32 @@ impl Parser {
             name,
             fields,
             span: struct_token.span,
+        })
+    }
+
+    fn parse_enum_decl(&mut self) -> Result<EnumDecl, ParseError> {
+        let enum_token = self.advance(); // consume 'enum'
+        let (name, _) = self.expect_ident()?;
+        self.expect(&TokenKind::LeftBrace)?;
+
+        let mut variants = Vec::new();
+        while !self.check(&TokenKind::RightBrace) && !self.is_at_end() {
+            let (variant_name, _) = self.expect_ident()?;
+            variants.push(variant_name);
+            if !self.match_token(&TokenKind::Comma) {
+                break;
+            }
+            // trailing comma before } is valid
+            if self.check(&TokenKind::RightBrace) {
+                break;
+            }
+        }
+        self.expect(&TokenKind::RightBrace)?;
+
+        Ok(EnumDecl {
+            name,
+            variants,
+            span: enum_token.span,
         })
     }
 
@@ -769,6 +823,19 @@ impl Parser {
                     index: Box::new(index),
                     span,
                 };
+            } else if self.check(&TokenKind::Question) {
+                // expr?  →  Try { expr }
+                let q = self.advance(); // consume '?'
+                let span = Span {
+                    line: expr.span().line,
+                    column: expr.span().column,
+                    start: expr.span().start,
+                    end: q.span.end,
+                };
+                expr = Expr::Try {
+                    expr: Box::new(expr),
+                    span,
+                };
             } else {
                 break;
             }
@@ -805,6 +872,34 @@ impl Parser {
                     span: token.span,
                 })
             }
+            TokenKind::FStringRaw(raw_parts) => {
+                let raw_parts = raw_parts.clone();
+                let span = token.span;
+                self.advance(); // consume the f-string token
+                // Re-lex and re-parse each Expr(...) part at parse time
+                let mut ast_parts = Vec::new();
+                for part in raw_parts {
+                    match part {
+                        FStringPart::Literal(s) => {
+                            ast_parts.push(AstFStringPart::Literal(s));
+                        }
+                        FStringPart::Expr(src) => {
+                            // Re-lex the expression source
+                            let tokens = Lexer::new(&src).tokenize().map_err(|e| ParseError {
+                                message: format!("in f-string '{{{}}}': {}", src, e.message),
+                                expected: "expression".to_string(),
+                                found: e.message,
+                                span,
+                            })?;
+                            // Re-parse as a single expression
+                            let mut sub = Parser::new(tokens);
+                            let expr = sub.parse_expression()?;
+                            ast_parts.push(AstFStringPart::Expr(Box::new(expr)));
+                        }
+                    }
+                }
+                Ok(Expr::FString { parts: ast_parts, span })
+            }
             TokenKind::BoolLiteral(v) => {
                 let v = *v;
                 self.advance();
@@ -831,6 +926,19 @@ impl Parser {
             TokenKind::Ident(name) => {
                 let name = name.clone();
                 self.advance();
+
+                // Check for enum variant access: Color::Red
+                if self.check(&TokenKind::ColonColon) {
+                    self.advance(); // consume '::'
+                    let (variant, _) = self.expect_ident()?;
+                    let span = Span {
+                        line: token.span.line,
+                        column: token.span.column,
+                        start: token.span.start,
+                        end: token.span.end + variant.len() + 2, // approximate
+                    };
+                    return Ok(Expr::EnumVariant { enum_name: name, variant, span });
+                }
 
                 // Check for struct initialization: Name { field: value, ... }
                 if self.check(&TokenKind::LeftBrace) {
@@ -1144,12 +1252,24 @@ impl Parser {
                         }
                     }
                     "none" => Ok(Pattern::None),
-                    other  => Ok(Pattern::Ident(other.to_string())),
+                    enum_name => {
+                        // Check for enum variant pattern: Color::Red
+                        if self.check(&TokenKind::ColonColon) {
+                            self.advance(); // consume '::'
+                            let (variant, _) = self.expect_ident()?;
+                            Ok(Pattern::EnumVariant {
+                                enum_name: enum_name.to_string(),
+                                variant,
+                            })
+                        } else {
+                            Ok(Pattern::Ident(enum_name.to_string()))
+                        }
+                    }
                 }
             }
             _ => Err(ParseError {
                 message: format!("expected pattern, found '{}'", token.kind),
-                expected: "ok(x), err(e), some(x), none, _ or identifier".to_string(),
+                expected: "ok(x), err(e), some(x), none, Color::Variant, _ or identifier".to_string(),
                 found: format!("{}", token.kind),
                 span: token.span,
             }),

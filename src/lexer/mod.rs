@@ -130,10 +130,18 @@ impl Lexer {
             '}' => TokenKind::RightBrace,
             ',' => TokenKind::Comma,
             ';' => TokenKind::Semicolon,
-            ':' => TokenKind::Colon,
+            ':' => {
+                if self.peek() == ':' {
+                    self.advance();
+                    TokenKind::ColonColon
+                } else {
+                    TokenKind::Colon
+                }
+            }
             '#' => TokenKind::Hash,
             '[' => TokenKind::LeftBracket,
             ']' => TokenKind::RightBracket,
+            '?' => TokenKind::Question,
 
             '-' => {
                 if self.peek() == '>' {
@@ -343,6 +351,12 @@ impl Lexer {
 
         let text: String = self.source[start..self.pos].iter().collect();
 
+        // Detect f-string: identifier is exactly "f" and next char is '"'
+        if text == "f" && !self.is_at_end() && self.peek() == '"' {
+            self.advance(); // consume '"'
+            return self.read_fstring(start, start_line, start_col);
+        }
+
         let kind = match lookup_keyword(&text) {
             Some(kw) => kw,
             None => TokenKind::Ident(text),
@@ -350,6 +364,83 @@ impl Lexer {
 
         Ok(Token {
             kind,
+            span: Span { line: start_line, column: start_col, start, end: self.pos },
+        })
+    }
+
+    fn read_fstring(&mut self, start: usize, start_line: usize, start_col: usize) -> Result<Token, LexerError> {
+        use crate::lexer::token::FStringPart;
+
+        let mut parts: Vec<FStringPart> = Vec::new();
+        let mut current_literal = String::new();
+
+        while !self.is_at_end() && self.peek() != '"' {
+            if self.peek() == '{' {
+                self.advance(); // consume '{'
+                // Save accumulated literal (if any)
+                if !current_literal.is_empty() {
+                    parts.push(FStringPart::Literal(std::mem::take(&mut current_literal)));
+                }
+                // Collect expression source until matching '}'
+                let mut expr_src = String::new();
+                let mut depth = 1usize;
+                while !self.is_at_end() && depth > 0 {
+                    let c = self.advance();
+                    match c {
+                        '{' => { depth += 1; expr_src.push(c); }
+                        '}' => { depth -= 1; if depth > 0 { expr_src.push(c); } }
+                        '\n' => {
+                            return Err(LexerError {
+                                message: "f-string expression cannot span multiple lines".to_string(),
+                                span: Span { line: start_line, column: start_col, start, end: self.pos },
+                            });
+                        }
+                        _ => expr_src.push(c),
+                    }
+                }
+                parts.push(FStringPart::Expr(expr_src.trim().to_string()));
+            } else if self.peek() == '\\' {
+                self.advance(); // consume '\'
+                if self.is_at_end() {
+                    return Err(LexerError {
+                        message: "unterminated escape in f-string".to_string(),
+                        span: Span { line: start_line, column: start_col, start, end: self.pos },
+                    });
+                }
+                match self.advance() {
+                    'n'  => current_literal.push('\n'),
+                    't'  => current_literal.push('\t'),
+                    '\\' => current_literal.push('\\'),
+                    '"'  => current_literal.push('"'),
+                    '{'  => current_literal.push('{'),
+                    '}'  => current_literal.push('}'),
+                    other => current_literal.push(other),
+                }
+            } else if self.peek() == '\n' {
+                return Err(LexerError {
+                    message: "unterminated f-string literal".to_string(),
+                    span: Span { line: start_line, column: start_col, start, end: self.pos },
+                });
+            } else {
+                current_literal.push(self.advance());
+            }
+        }
+
+        if self.is_at_end() {
+            return Err(LexerError {
+                message: "unterminated f-string literal".to_string(),
+                span: Span { line: start_line, column: start_col, start, end: self.pos },
+            });
+        }
+        self.advance(); // consume closing '"'
+
+        // Save any remaining literal
+        if !current_literal.is_empty() {
+            parts.push(FStringPart::Literal(current_literal));
+        }
+
+        Ok(Token {
+            kind: TokenKind::FStringRaw(parts),
             span: Span { line: start_line, column: start_col, start, end: self.pos },
         })
     }

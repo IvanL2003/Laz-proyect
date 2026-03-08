@@ -41,6 +41,9 @@ pub enum TokenKind {
     Return,
     Print,
     Struct,
+    Enum,
+    Break,
+    Continue,
     Connect,
     File,
     Db,
@@ -90,6 +93,7 @@ pub enum TokenKind {
     Dot,
     Semicolon,
     Colon,
+    ColonColon, // ::
     Arrow,    // ->
     FatArrow, // =>
     DotDot,
@@ -110,8 +114,21 @@ pub enum TokenKind {
     Into,
     Values,
 
+    // Try / propagation
+    Question, // ? (postfix unwrap operator)
+
+    // F-string:  f"Hola {name}, tienes {age} años"
+    FStringRaw(Vec<FStringPart>),
+
     // Special
     Eof,
+}
+
+/// A segment of an f-string token.
+#[derive(Debug, Clone, PartialEq)]
+pub enum FStringPart {
+    Literal(String), // plain text between interpolations
+    Expr(String),    // raw source of the expression inside { }
 }
 
 impl std::fmt::Display for TokenKind {
@@ -133,6 +150,9 @@ impl std::fmt::Display for TokenKind {
             TokenKind::Return => write!(f, "return"),
             TokenKind::Print => write!(f, "print"),
             TokenKind::Struct => write!(f, "struct"),
+            TokenKind::Enum => write!(f, "enum"),
+            TokenKind::Break => write!(f, "break"),
+            TokenKind::Continue => write!(f, "continue"),
             TokenKind::Connect => write!(f, "connect"),
             TokenKind::File => write!(f, "file"),
             TokenKind::Db => write!(f, "db"),
@@ -170,6 +190,7 @@ impl std::fmt::Display for TokenKind {
             TokenKind::Dot => write!(f, "."),
             TokenKind::Semicolon => write!(f, ";"),
             TokenKind::Colon => write!(f, ":"),
+            TokenKind::ColonColon => write!(f, "::"),
             TokenKind::Arrow => write!(f, "->"),
             TokenKind::FatArrow => write!(f, "=>"),
             TokenKind::DotDot => write!(f, ".."),
@@ -183,6 +204,8 @@ impl std::fmt::Display for TokenKind {
             TokenKind::Insert => write!(f, "INSERT"),
             TokenKind::Into => write!(f, "INTO"),
             TokenKind::Values => write!(f, "VALUES"),
+            TokenKind::Question => write!(f, "?"),
+            TokenKind::FStringRaw(_) => write!(f, "f-string"),
             TokenKind::Eof => write!(f, "EOF"),
         }
     }
@@ -209,8 +232,11 @@ pub fn lookup_keyword(ident: &str) -> Option<TokenKind> {
         "return" => Some(TokenKind::Return),
         "print" => Some(TokenKind::Print),
         "struct" => Some(TokenKind::Struct),
+        "enum" => Some(TokenKind::Enum),
         "connect" => Some(TokenKind::Connect),
         "file" => Some(TokenKind::File),
+        "db" => Some(TokenKind::Db),
+        "api" => Some(TokenKind::Api),
         "as" => Some(TokenKind::As),
         "match" => Some(TokenKind::Match),
         "import" => Some(TokenKind::Import),

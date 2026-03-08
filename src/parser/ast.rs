@@ -10,20 +10,43 @@ pub struct Program {
 pub enum Declaration {
     Function(FnDecl),
     Struct(StructDecl),
+    Enum(EnumDecl),
     Connect(ConnectDecl),
     Statement(Stmt),
     // import "otro_archivo.lz";
     Import { path: String, span: Span },
 }
 
+// enum Color { Red, Green, Blue }
+// name="Color"  variants=["Red", "Green", "Blue"]
+#[derive(Debug, Clone)]
+pub struct EnumDecl {
+    pub name: String,
+    pub variants: Vec<String>,
+    pub span: Span,
+}
+
 // connect file "users.csv" as users;
 // connect_type=File  file_path="users.csv"  alias="users"
+//
+// connect db "data.db" as mydb { User from users, Product from products };
+// connect_type=Db  file_path="data.db"  alias="mydb"
+// mappings=[DbMapping{struct_name="User", table_name="users"}, ...]
 #[derive(Debug, Clone)]
 pub struct ConnectDecl {
     pub connect_type: ConnectType, // file | db | api
     pub file_path: String,         // ruta al archivo
     pub alias: String,             // nombre con el que se referencia en SQL
+    pub mappings: Vec<DbMapping>,  // solo para db: struct <-> tabla
     pub span: Span,
+}
+
+// Un mapping dentro de connect db:  User from users
+// struct_name="User"  table_name="users"
+#[derive(Debug, Clone)]
+pub struct DbMapping {
+    pub struct_name: String, // nombre del struct Laz a auto-generar
+    pub table_name: String,  // nombre de la tabla en el archivo .db
 }
 
 // fn distance(p1: Point, p2: Point) -> float { ... }
@@ -209,6 +232,7 @@ pub struct MatchArm {
 //   None    --> none      sin binding
 //   Wildcard --> _        case default, sin binding
 //   Ident(x) --> x        bindea cualquier valor como x (como wildcard con nombre)
+//   EnumVariant --> Color::Red   variant of a user-defined enum
 #[derive(Debug, Clone)]
 pub enum Pattern {
     Ok(String),
@@ -217,6 +241,14 @@ pub enum Pattern {
     None,
     Wildcard,
     Ident(String),
+    EnumVariant { enum_name: String, variant: String },
+}
+
+/// A segment of an f-string after parsing.
+#[derive(Debug, Clone)]
+pub enum AstFStringPart {
+    Literal(String),    // plain text
+    Expr(Box<Expr>),    // parsed expression
 }
 
 #[derive(Debug, Clone)]
@@ -229,6 +261,9 @@ pub enum Expr {
 
     // "hello world"
     StringLiteral { value: String, span: Span },
+
+    // f"Hola {name}, tienes {age} años"
+    FString { parts: Vec<AstFStringPart>, span: Span },
 
     // true  |  false
     BoolLiteral { value: bool, span: Span },
@@ -342,6 +377,25 @@ pub enum Expr {
         values: Vec<Expr>,            // VALUES (...)
         span: Span,
     },
+
+    // expr?
+    // Operador de propagacion para Result y Option:
+    //   ok(v)?    -->  devuelve v (unwrap)
+    //   err(e)?   -->  return err(e) desde la funcion actual
+    //   some(v)?  -->  devuelve v (unwrap)
+    //   none?     -->  return none desde la funcion actual
+    Try {
+        expr: Box<Expr>,
+        span: Span,
+    },
+
+    // Color::Red   (acceso a variante de enum user-defined)
+    // enum_name="Color"  variant="Red"
+    EnumVariant {
+        enum_name: String,
+        variant: String,
+        span: Span,
+    },
 }
 
 impl Expr {
@@ -361,8 +415,11 @@ impl Expr {
             | Expr::ListLiteral { span, .. }
             | Expr::Index { span, .. }
             | Expr::Lambda { span, .. }
+            | Expr::FString { span, .. }
             | Expr::SqlSelect { span, .. }
-            | Expr::SqlInsert { span, .. } => *span,
+            | Expr::SqlInsert { span, .. }
+            | Expr::Try { span, .. }
+            | Expr::EnumVariant { span, .. } => *span,
         }
     }
 }

@@ -1,0 +1,34 @@
+connect db "shop.db" as shop {
+    User from users,
+    Product from products,
+};
+
+// Seleccionar todos los usuarios
+let all_users = #SELECT * FROM users;
+print("All users:", len(all_users));
+
+// Filtrar con WHERE
+let adults = #SELECT * FROM users WHERE age > 28;
+print("Adults (age > 28):", len(adults));
+
+for i in 0..len(adults) {
+    let u = adults[i];
+    print(" -", u.name, "age:", u.age, "city:", u.city);
+}
+
+// SELECT SINGLE
+let bob = #SELECT SINGLE * FROM users WHERE name == "Bob";
+print("Found:", bob.name, "from", bob.city);
+
+// Productos
+let products = #SELECT * FROM products;
+print("Products:");
+for i in 0..len(products) {
+    let p = products[i];
+    print(" -", p.title, "price:", p.price);
+}
+
+// INSERT una nueva fila
+#INSERT INTO users VALUES ("David", 22, "Valencia");
+let after_insert = #SELECT * FROM users;
+print("After insert:", len(after_insert), "users");

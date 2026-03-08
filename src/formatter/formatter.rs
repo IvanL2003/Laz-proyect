@@ -101,6 +101,7 @@ impl Formatter {
             let current_kind = match decl {
                 Declaration::Function(_) => "fn",
                 Declaration::Struct(_) => "struct",
+                Declaration::Enum(_) => "enum",
                 Declaration::Connect(_) => "connect",
                 Declaration::Statement(_) => "stmt",
                 Declaration::Import { .. } => "import",
@@ -121,6 +122,7 @@ impl Formatter {
         match decl {
             Declaration::Function(f) => f.span,
             Declaration::Struct(s) => s.span,
+            Declaration::Enum(e) => e.span,
             Declaration::Connect(c) => c.span,
             Declaration::Statement(s) => self.stmt_span(s),
             Declaration::Import { span, .. } => *span,
@@ -131,6 +133,7 @@ impl Formatter {
         match decl {
             Declaration::Function(f) => self.format_fn_decl(f, next_decl_line),
             Declaration::Struct(s) => self.format_struct_decl(s, next_decl_line),
+            Declaration::Enum(e) => self.format_enum_decl(e),
             Declaration::Connect(c) => self.format_connect(c),
             Declaration::Statement(s) => self.format_statement(s),
             Declaration::Import { path, span } => {
@@ -140,19 +143,56 @@ impl Formatter {
         }
     }
 
+    fn format_enum_decl(&mut self, decl: &EnumDecl) {
+        self.output.push_str(&format!("{}enum {} {{\n", self.indent(), decl.name));
+        self.indent_level += 1;
+        for variant in &decl.variants {
+            self.output.push_str(&format!("{}{},\n", self.indent(), variant));
+        }
+        self.indent_level -= 1;
+        self.output.push_str(&format!("{}}}\n", self.indent()));
+    }
+
     fn format_connect(&mut self, decl: &ConnectDecl) {
         let connect_keyword = match decl.connect_type {
             crate::lexer::token::ConnectType::File => "file",
             crate::lexer::token::ConnectType::Db => "db",
             crate::lexer::token::ConnectType::Api => "api",
         };
-        self.output.push_str(&format!(
-            "{}connect {} \"{}\" as {};\n",
-            self.indent(),
-            connect_keyword,
-            decl.file_path,
-            decl.alias
-        ));
+
+        if decl.mappings.is_empty() {
+            self.output.push_str(&format!(
+                "{}connect {} \"{}\" as {};\n",
+                self.indent(),
+                connect_keyword,
+                decl.file_path,
+                decl.alias
+            ));
+        } else {
+            // connect db "data.db" as mydb {
+            //     User from users,
+            //     Product from products,
+            // };
+            self.output.push_str(&format!(
+                "{}connect {} \"{}\" as {} {{\n",
+                self.indent(),
+                connect_keyword,
+                decl.file_path,
+                decl.alias
+            ));
+            self.indent_level += 1;
+            for mapping in &decl.mappings {
+                self.output.push_str(&format!(
+                    "{}{} from {},\n",
+                    self.indent(),
+                    mapping.struct_name,
+                    mapping.table_name
+                ));
+            }
+            self.indent_level -= 1;
+            self.output.push_str(&format!("{}}};\n", self.indent()));
+        }
+
         self.emit_inline_comment(decl.span.line);
     }
 
@@ -459,6 +499,7 @@ impl Formatter {
             Pattern::None       => "none".to_string(),
             Pattern::Wildcard   => "_".to_string(),
             Pattern::Ident(name) => name.clone(),
+            Pattern::EnumVariant { enum_name, variant } => format!("{}::{}", enum_name, variant),
         }
     }
 
@@ -645,6 +686,37 @@ impl Formatter {
                     self.format_sql_table_ref(table_ref),
                     vals_str
                 )
+            }
+            Expr::Try { expr, .. } => {
+                format!("{}?", self.format_expr(expr))
+            }
+            Expr::FString { parts, .. } => {
+                let mut s = String::from("f\"");
+                for part in parts {
+                    match part {
+                        AstFStringPart::Literal(lit) => {
+                            for ch in lit.chars() {
+                                match ch {
+                                    '"'  => s.push_str("\\\""),
+                                    '\\' => s.push_str("\\\\"),
+                                    '\n' => s.push_str("\\n"),
+                                    '\t' => s.push_str("\\t"),
+                                    _    => s.push(ch),
+                                }
+                            }
+                        }
+                        AstFStringPart::Expr(expr) => {
+                            s.push('{');
+                            s.push_str(&self.format_expr(expr));
+                            s.push('}');
+                        }
+                    }
+                }
+                s.push('"');
+                s
+            }
+            Expr::EnumVariant { enum_name, variant, .. } => {
+                format!("{}::{}", enum_name, variant)
             }
         }
     }

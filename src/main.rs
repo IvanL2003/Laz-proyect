@@ -6,7 +6,7 @@ use laz::parser::Parser;
 use laz::semantic::TypeChecker;
 use laz::codegen::Interpreter;
 use laz::formatter::Formatter;
-use laz::utils::error::format_error;
+use laz::utils::error::{format_error, format_warning};
 
 fn main() {
     let command = match cli::parse_args() {
@@ -56,11 +56,18 @@ fn run_program(config: cli::RunConfig) {
     };
 
     // Semantic analysis
-    if let Err(errors) = TypeChecker::check(&program) {
-        for e in &errors {
-            eprint!("{}", format_error(&e.clone().into(), source, &config.filename));
+    match TypeChecker::check(&program, &base_dir) {
+        Ok(warnings) => {
+            for w in &warnings {
+                eprint!("{}", format_warning(w, source, &config.filename));
+            }
         }
-        std::process::exit(1);
+        Err(errors) => {
+            for e in &errors {
+                eprint!("{}", format_error(&e.clone().into(), source, &config.filename));
+            }
+            std::process::exit(1);
+        }
     }
 
     // Interpretation
