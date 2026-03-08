@@ -1,9 +1,9 @@
-use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
 use crate::lexer::Span;
 use crate::parser::ast::*;
-use crate::utils::error::RuntimeError;
 use crate::utils::csv::DataTable;
+use crate::utils::error::RuntimeError;
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 
 // --- Runtime Values ---
 
@@ -36,6 +36,39 @@ pub enum Value {
     Some(Box<Value>),
     None,
     Void,
+}
+
+impl PartialEq for Value {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            // Primitivos
+            (Value::Int(a), Value::Int(b)) => a == b,
+            (Value::Float(a), Value::Float(b)) => a == b,
+            (Value::Int(a), Value::Float(b)) => (*a as f64) == *b,
+            (Value::Float(a), Value::Int(b)) => *a == (*b as f64),
+            (Value::Bool(a), Value::Bool(b)) => a == b,
+            (Value::Str(a), Value::Str(b)) => a == b,
+            // Compuestos
+            (Value::List(a), Value::List(b)) => a == b,
+            (Value::Ok(a), Value::Ok(b)) => a == b,
+            (Value::Err(a), Value::Err(b)) => a == b,
+            (Value::Some(a), Value::Some(b)) => a == b,
+            (Value::None, Value::None) => true,
+            (Value::Void, Value::Void) => true,
+            (
+                Value::StructInstance {
+                    type_name: t1,
+                    fields: f1,
+                },
+                Value::StructInstance {
+                    type_name: t2,
+                    fields: f2,
+                },
+            ) => t1 == t2 && f1 == f2,
+            // Tipos distintos → siempre false
+            _ => false,
+        }
+    }
 }
 
 impl Value {
@@ -82,11 +115,11 @@ impl Value {
                 let strs: Vec<String> = items.iter().map(|v| v.to_display_string()).collect();
                 format!("[{}]", strs.join(", "))
             }
-            Value::Ok(inner)   => format!("ok({})", inner.to_display_string()),
-            Value::Err(inner)  => format!("err({})", inner.to_display_string()),
+            Value::Ok(inner) => format!("ok({})", inner.to_display_string()),
+            Value::Err(inner) => format!("err({})", inner.to_display_string()),
             Value::Some(inner) => format!("some({})", inner.to_display_string()),
-            Value::None        => "none".to_string(),
-            Value::Void        => "void".to_string(),
+            Value::None => "none".to_string(),
+            Value::Void => "void".to_string(),
         }
     }
 }
@@ -191,31 +224,64 @@ pub struct Interpreter {
     environment: Environment,
     functions: HashMap<String, FnDecl>,
     structs: HashMap<String, StructDecl>,
-    alias: HashMap<String, String>,       // alias -> file path
+    alias: HashMap<String, String>, // alias -> file path
     base_dir: PathBuf,
     native_functions: HashMap<String, fn(Vec<Value>) -> Result<Value, RuntimeError>>,
-    imported_files: HashSet<PathBuf>,     // para evitar imports circulares
+    imported_files: HashSet<PathBuf>, // para evitar imports circulares
 }
 
 impl Interpreter {
     pub fn new(base_dir: PathBuf) -> Self {
-        let mut native_functions: HashMap<String, fn(Vec<Value>) -> Result<Value, RuntimeError>> = HashMap::new();
-        native_functions.insert("typeOf".to_string(),   native_type_of);
-        native_functions.insert("len".to_string(),      native_len);
-        native_functions.insert("push".to_string(),     native_push);
-        native_functions.insert("pop".to_string(),      native_pop);
+        let mut native_functions: HashMap<String, fn(Vec<Value>) -> Result<Value, RuntimeError>> =
+            HashMap::new();
+        native_functions.insert("typeOf".to_string(), native_type_of);
+        native_functions.insert("len".to_string(), native_len);
+        native_functions.insert("push".to_string(), native_push);
+        native_functions.insert("pop".to_string(), native_pop);
         native_functions.insert("toString".to_string(), native_to_string);
         native_functions.insert("parseInt".to_string(), native_parse_int);
-        native_functions.insert("toFloat".to_string(),  native_parse_float);
-        native_functions.insert("ok".to_string(),       native_ok);
-        native_functions.insert("err".to_string(),      native_err);
-        native_functions.insert("some".to_string(),     native_some);
-        native_functions.insert("none".to_string(),     native_none);
-        native_functions.insert("unwrap".to_string(),   native_unwrap);
-        native_functions.insert("is_ok".to_string(),    native_is_ok);
-        native_functions.insert("is_err".to_string(),   native_is_err);
-        native_functions.insert("is_some".to_string(),  native_is_some);
-        native_functions.insert("is_none".to_string(),  native_is_none);
+        native_functions.insert("toFloat".to_string(), native_parse_float);
+        native_functions.insert("ok".to_string(), native_ok);
+        native_functions.insert("err".to_string(), native_err);
+        native_functions.insert("some".to_string(), native_some);
+        native_functions.insert("none".to_string(), native_none);
+        native_functions.insert("unwrap".to_string(), native_unwrap);
+        native_functions.insert("is_ok".to_string(), native_is_ok);
+        native_functions.insert("is_err".to_string(), native_is_err);
+        native_functions.insert("is_some".to_string(), native_is_some);
+        native_functions.insert("is_none".to_string(), native_is_none);
+        native_functions.insert("split".to_string(), native_split);
+        native_functions.insert("join".to_string(), native_join);
+        native_functions.insert("contains".to_string(), native_contains);
+        native_functions.insert("trim".to_string(), native_trim);
+        native_functions.insert("lower".to_string(), native_lower);
+        native_functions.insert("upper".to_string(), native_upper);
+        native_functions.insert("replace".to_string(), native_replace);
+        native_functions.insert("substring".to_string(), native_substring);
+        native_functions.insert("abs".to_string(), native_abs);
+        native_functions.insert("sqrt".to_string(), native_sqrt);
+        native_functions.insert("pow".to_string(), native_pow);
+        native_functions.insert("powf".to_string(), native_powf);
+        native_functions.insert("log".to_string(), native_log);
+        native_functions.insert("sin".to_string(), native_sin);
+        native_functions.insert("cos".to_string(), native_cos);
+        native_functions.insert("tan".to_string(), native_tan);
+        native_functions.insert("exp".to_string(), native_exp);
+        native_functions.insert("ln".to_string(), native_ln);
+        native_functions.insert("log".to_string(), native_log);
+        native_functions.insert("log2".to_string(), native_log2);
+        native_functions.insert("log10".to_string(), native_log10);
+        native_functions.insert("floor".to_string(), native_floor);
+        native_functions.insert("ceil".to_string(), native_ceil);
+        native_functions.insert("round".to_string(), native_round);
+        native_functions.insert("endsWith".to_string(), native_ends_with);
+        native_functions.insert("startsWith".to_string(), native_starts_with);
+        native_functions.insert("max".to_string(), native_max);
+        native_functions.insert("min".to_string(), native_min);
+        native_functions.insert("range".to_string(), native_range);
+        native_functions.insert("indexOf".to_string(), native_index_of);
+        native_functions.insert("lastIndexOf".to_string(), native_last_index_of);
+
         Interpreter {
             environment: Environment::new(),
             functions: HashMap::new(),
@@ -256,7 +322,12 @@ impl Interpreter {
 
         // Call main if it exists
         if self.functions.contains_key("main") {
-            let dummy_span = Span { line: 0, column: 0, start: 0, end: 0 };
+            let dummy_span = Span {
+                line: 0,
+                column: 0,
+                start: 0,
+                end: 0,
+            };
             self.call_function("main", vec![], dummy_span)?;
         }
 
@@ -294,10 +365,19 @@ impl Interpreter {
         // Solo registrar funciones, structs y connects — no ejecutar statements
         for decl in &program.declarations {
             match decl {
-                Declaration::Function(f) => { self.functions.insert(f.name.clone(), f.clone()); }
-                Declaration::Struct(s)   => { self.structs.insert(s.name.clone(), s.clone()); }
-                Declaration::Connect(c)  => { self.alias.insert(c.alias.clone(), c.file_path.clone()); }
-                Declaration::Import { path: inner_path, span: inner_span } => {
+                Declaration::Function(f) => {
+                    self.functions.insert(f.name.clone(), f.clone());
+                }
+                Declaration::Struct(s) => {
+                    self.structs.insert(s.name.clone(), s.clone());
+                }
+                Declaration::Connect(c) => {
+                    self.alias.insert(c.alias.clone(), c.file_path.clone());
+                }
+                Declaration::Import {
+                    path: inner_path,
+                    span: inner_span,
+                } => {
                     // imports transitivos
                     self.process_import(inner_path, *inner_span)?;
                 }
@@ -331,7 +411,13 @@ impl Interpreter {
             // let mut count = 0;  mutable=true,  type_ann=None (inferido)
             // El inicializador es siempre una expresion que se evalua normalmente.
             // Si hay type_ann, se verifica compatibilidad DESPUES de evaluar.
-            Stmt::Let { name, mutable, type_ann, initializer, span } => {
+            Stmt::Let {
+                name,
+                mutable,
+                type_ann,
+                initializer,
+                span,
+            } => {
                 let value = self.evaluate_expr(initializer)?;
                 if let Some(ta) = type_ann {
                     self.check_type_compat(&value, ta, *span)?;
@@ -343,7 +429,11 @@ impl Interpreter {
             // x = 5;       AssignTarget::Variable("x")
             // p.x = 1.0;   AssignTarget::FieldAccess { object=Identifier("p"), field="x" }
             // Para FieldAccess: get struct → modifica campo → set struct de vuelta
-            Stmt::Assign { target, value, span } => {
+            Stmt::Assign {
+                target,
+                value,
+                span,
+            } => {
                 let val = self.evaluate_expr(value)?;
                 match target {
                     // Reasignacion simple de variable (debe ser mut)
@@ -351,14 +441,19 @@ impl Interpreter {
                         self.environment.set(name, val, *span)?;
                     }
                     // arr[i] = val — muta el elemento i de la lista
-                    AssignTarget::Index { object: var_name, index } => {
+                    AssignTarget::Index {
+                        object: var_name,
+                        index,
+                    } => {
                         let idx_val = self.evaluate_expr(index)?;
                         let idx = match idx_val {
                             Value::Int(i) => i,
-                            _ => return Err(RuntimeError {
-                                message: "list index must be an integer".to_string(),
-                                span: *span,
-                            }),
+                            _ => {
+                                return Err(RuntimeError {
+                                    message: "list index must be an integer".to_string(),
+                                    span: *span,
+                                })
+                            }
                         };
                         let mut list_val = self.environment.get(var_name, *span)?;
                         if let Value::List(ref mut items) = list_val {
@@ -419,14 +514,21 @@ impl Interpreter {
             //   None       = sin rama else
             //   Some(block)= else o else-if (el bloque puede contener un Stmt::If anidado)
             // La condicion siempre debe ser bool.
-            Stmt::If { condition, then_block, else_block, span } => {
+            Stmt::If {
+                condition,
+                then_block,
+                else_block,
+                span,
+            } => {
                 let cond = self.evaluate_expr(condition)?;
                 let cond_bool = match cond {
                     Value::Bool(b) => b,
-                    _ => return Err(RuntimeError {
-                        message: format!("condition must be bool, got '{}'", cond.type_name()),
-                        span: *span,
-                    }),
+                    _ => {
+                        return Err(RuntimeError {
+                            message: format!("condition must be bool, got '{}'", cond.type_name()),
+                            span: *span,
+                        })
+                    }
                 };
 
                 if cond_bool {
@@ -442,15 +544,24 @@ impl Interpreter {
             // while cond { ... }
             // La condicion DEBE ser bool; itera hasta que sea false
             // Si el cuerpo tiene return, propaga hacia arriba (StmtResult::Return)
-            Stmt::While { condition, body, span } => {
+            Stmt::While {
+                condition,
+                body,
+                span,
+            } => {
                 loop {
                     let cond = self.evaluate_expr(condition)?;
                     let cond_bool = match cond {
                         Value::Bool(b) => b,
-                        _ => return Err(RuntimeError {
-                            message: format!("condition must be bool, got '{}'", cond.type_name()),
-                            span: *span,
-                        }),
+                        _ => {
+                            return Err(RuntimeError {
+                                message: format!(
+                                    "condition must be bool, got '{}'",
+                                    cond.type_name()
+                                ),
+                                span: *span,
+                            })
+                        }
                     };
 
                     if !cond_bool {
@@ -468,22 +579,31 @@ impl Interpreter {
             // for i in 1..10 { ... }
             // variable="i"  start y end DEBEN ser int; end es EXCLUSIVO (como Rust)
             // La variable del bucle es inmutable y solo existe dentro del cuerpo
-            Stmt::For { variable, start, end, body, span } => {
+            Stmt::For {
+                variable,
+                start,
+                end,
+                body,
+                span,
+            } => {
                 let start_val = self.evaluate_expr(start)?;
                 let end_val = self.evaluate_expr(end)?;
 
                 let (start_i, end_i) = match (&start_val, &end_val) {
                     (Value::Int(s), Value::Int(e)) => (*s, *e),
-                    _ => return Err(RuntimeError {
-                        message: "for range bounds must be integers".to_string(),
-                        span: *span,
-                    }),
+                    _ => {
+                        return Err(RuntimeError {
+                            message: "for range bounds must be integers".to_string(),
+                            span: *span,
+                        })
+                    }
                 };
 
                 for i in start_i..end_i {
                     // Nuevo scope por iteracion para aislar la variable del bucle
                     self.environment.push_scope();
-                    self.environment.define(variable.clone(), Value::Int(i), false);
+                    self.environment
+                        .define(variable.clone(), Value::Int(i), false);
                     let result = self.execute_block_inner(body);
                     self.environment.pop_scope();
 
@@ -528,7 +648,11 @@ impl Interpreter {
             // match expr { pattern => { body } ... }
             // Evalua subject, recorre arms hasta el primer pattern que coincida,
             // ejecuta su body en un scope que incluye las variables bindeadas por el pattern.
-            Stmt::Match { subject, arms, span } => {
+            Stmt::Match {
+                subject,
+                arms,
+                span,
+            } => {
                 let val = self.evaluate_expr(subject)?;
                 for arm in arms {
                     if let Some(bindings) = self.match_pattern(&arm.pattern, &val) {
@@ -543,7 +667,10 @@ impl Interpreter {
                 }
                 // Ningun pattern coincidio (sin wildcard/_ al final)
                 Err(RuntimeError {
-                    message: format!("non-exhaustive match: no arm matched value '{}'", val.to_display_string()),
+                    message: format!(
+                        "non-exhaustive match: no arm matched value '{}'",
+                        val.to_display_string()
+                    ),
                     span: *span,
                 })
             }
@@ -555,15 +682,9 @@ impl Interpreter {
     // o None si no coincide.
     fn match_pattern(&self, pattern: &Pattern, value: &Value) -> Option<Vec<(String, Value)>> {
         match (pattern, value) {
-            (Pattern::Ok(bind), Value::Ok(inner)) => {
-                Some(vec![(bind.clone(), *inner.clone())])
-            }
-            (Pattern::Err(bind), Value::Err(inner)) => {
-                Some(vec![(bind.clone(), *inner.clone())])
-            }
-            (Pattern::Some(bind), Value::Some(inner)) => {
-                Some(vec![(bind.clone(), *inner.clone())])
-            }
+            (Pattern::Ok(bind), Value::Ok(inner)) => Some(vec![(bind.clone(), *inner.clone())]),
+            (Pattern::Err(bind), Value::Err(inner)) => Some(vec![(bind.clone(), *inner.clone())]),
+            (Pattern::Some(bind), Value::Some(inner)) => Some(vec![(bind.clone(), *inner.clone())]),
             (Pattern::None, Value::None) => Some(vec![]),
             (Pattern::Wildcard, _) => Some(vec![]),
             (Pattern::Ident(name), v) => Some(vec![(name.clone(), v.clone())]),
@@ -583,9 +704,7 @@ impl Interpreter {
             Expr::BoolLiteral { value, .. } => Ok(Value::Bool(*value)),
 
             // x, name, users  -->  busca la variable en el Environment (scope mas interno primero)
-            Expr::Identifier { name, span } => {
-                self.environment.get(name, *span)
-            }
+            Expr::Identifier { name, span } => self.environment.get(name, *span),
 
             // (expr)  -->  simplemente evalua la expresion interior, el agrupamiento no cambia el valor
             Expr::Grouped { expr, .. } => self.evaluate_expr(expr),
@@ -602,15 +721,21 @@ impl Interpreter {
 
             // objeto[indice]  -->  accede al elemento indice de la lista
             // indice debe ser int; error si fuera de rango
-            Expr::Index { object, index, span } => {
+            Expr::Index {
+                object,
+                index,
+                span,
+            } => {
                 let obj_val = self.evaluate_expr(object)?;
                 let idx_val = self.evaluate_expr(index)?;
                 let idx = match idx_val {
                     Value::Int(i) => i,
-                    _ => return Err(RuntimeError {
-                        message: "list index must be an integer".to_string(),
-                        span: *span,
-                    }),
+                    _ => {
+                        return Err(RuntimeError {
+                            message: "list index must be an integer".to_string(),
+                            span: *span,
+                        })
+                    }
                 };
                 match obj_val {
                     Value::List(items) => {
@@ -660,7 +785,12 @@ impl Interpreter {
             //   a && b --> si a es false, devuelve false sin evaluar b
             //   a || b --> si a es true,  devuelve true  sin evaluar b
             // El resto de operadores (+, -, *, /, %, ==, !=, <, <=, >, >=) van a eval_binary_op
-            Expr::BinaryOp { left, op, right, span } => {
+            Expr::BinaryOp {
+                left,
+                op,
+                right,
+                span,
+            } => {
                 // Short-circuit for logical operators
                 if matches!(op, BinaryOp::And | BinaryOp::Or) {
                     let left_val = self.evaluate_expr(left)?;
@@ -673,7 +803,11 @@ impl Interpreter {
                             match (&left_val, &right_val) {
                                 (Value::Bool(_), Value::Bool(b)) => Ok(Value::Bool(*b)),
                                 _ => Err(RuntimeError {
-                                    message: format!("'&&' requires bool operands, got '{}' and '{}'", left_val.type_name(), right_val.type_name()),
+                                    message: format!(
+                                        "'&&' requires bool operands, got '{}' and '{}'",
+                                        left_val.type_name(),
+                                        right_val.type_name()
+                                    ),
                                     span: *span,
                                 }),
                             }
@@ -686,7 +820,11 @@ impl Interpreter {
                             match (&left_val, &right_val) {
                                 (Value::Bool(_), Value::Bool(b)) => Ok(Value::Bool(*b)),
                                 _ => Err(RuntimeError {
-                                    message: format!("'||' requires bool operands, got '{}' and '{}'", left_val.type_name(), right_val.type_name()),
+                                    message: format!(
+                                        "'||' requires bool operands, got '{}' and '{}'",
+                                        left_val.type_name(),
+                                        right_val.type_name()
+                                    ),
                                     span: *span,
                                 }),
                             }
@@ -713,7 +851,11 @@ impl Interpreter {
 
             // objeto.campo   ej: p.x, user.name
             // Evalua object (debe ser StructInstance) y extrae el campo por nombre
-            Expr::FieldAccess { object, field, span } => {
+            Expr::FieldAccess {
+                object,
+                field,
+                span,
+            } => {
                 let obj = self.evaluate_expr(object)?;
                 match obj {
                     Value::StructInstance { fields, .. } => {
@@ -723,7 +865,11 @@ impl Interpreter {
                         })
                     }
                     _ => Err(RuntimeError {
-                        message: format!("cannot access field '{}' on '{}'", field, obj.type_name()),
+                        message: format!(
+                            "cannot access field '{}' on '{}'",
+                            field,
+                            obj.type_name()
+                        ),
                         span: *span,
                     }),
                 }
@@ -736,10 +882,14 @@ impl Interpreter {
             // 3. Verifica que esten todos los campos declarados
             // 4. Devuelve Value::StructInstance { type_name, fields: HashMap }
             Expr::StructInit { name, fields, span } => {
-                let struct_decl = self.structs.get(name).cloned().ok_or_else(|| RuntimeError {
-                    message: format!("undefined struct '{}'", name),
-                    span: *span,
-                })?;
+                let struct_decl = self
+                    .structs
+                    .get(name)
+                    .cloned()
+                    .ok_or_else(|| RuntimeError {
+                        message: format!("undefined struct '{}'", name),
+                        span: *span,
+                    })?;
 
                 let mut field_values = HashMap::new();
                 for (fname, fexpr) in fields {
@@ -765,15 +915,21 @@ impl Interpreter {
 
             // #SELECT cols FROM tabla WHERE cond
             // Devuelve List<StructInstance> (o un StructInstance si es SINGLE).
-            Expr::SqlSelect { columns, table_ref, condition, single, span } => {
-                self.execute_sql_select(columns, table_ref, condition.as_deref(), *single, *span)
-            }
+            Expr::SqlSelect {
+                columns,
+                table_ref,
+                condition,
+                single,
+                span,
+            } => self.execute_sql_select(columns, table_ref, condition.as_deref(), *single, *span),
 
             // #INSERT INTO tabla VALUES (expr1, expr2, ...)
             // Evalua las expresiones de values y las convierte a strings para el DataTable
-            Expr::SqlInsert { table_ref, values, span } => {
-                self.execute_sql_insert(table_ref, values, *span)
-            }
+            Expr::SqlInsert {
+                table_ref,
+                values,
+                span,
+            } => self.execute_sql_insert(table_ref, values, *span),
         }
     }
 
@@ -782,7 +938,11 @@ impl Interpreter {
     // Resuelve un SqlTableRef a (PathBuf, nombre_tabla):
     //   Alias("users")       -->  busca en self.alias["users"] --> base_dir + "users.csv"
     //   Inline("data.csv")   -->  usa la ruta directamente      --> base_dir + "data.csv"
-    fn resolve_file_path(&self, table_ref: &SqlTableRef, span: Span) -> Result<(PathBuf, String), RuntimeError> {
+    fn resolve_file_path(
+        &self,
+        table_ref: &SqlTableRef,
+        span: Span,
+    ) -> Result<(PathBuf, String), RuntimeError> {
         match table_ref {
             SqlTableRef::Alias(alias) => {
                 if let Some(file_path) = self.alias.get(alias) {
@@ -796,7 +956,8 @@ impl Interpreter {
             }
             SqlTableRef::Inline(file_path) => {
                 let path = std::path::Path::new(file_path);
-                let name = path.file_stem()
+                let name = path
+                    .file_stem()
                     .and_then(|s| s.to_str())
                     .unwrap_or(file_path)
                     .to_string();
@@ -829,7 +990,12 @@ impl Interpreter {
         Value::Str(s.to_string())
     }
 
-    fn row_to_struct(struct_name: &str, headers: &[String], row: &[String], columns: &[String]) -> Value {
+    fn row_to_struct(
+        struct_name: &str,
+        headers: &[String],
+        row: &[String],
+        columns: &[String],
+    ) -> Value {
         let mut fields = HashMap::new();
         let use_all = columns.len() == 1 && columns[0] == "*";
 
@@ -885,10 +1051,8 @@ impl Interpreter {
         span: Span,
     ) -> Result<Value, RuntimeError> {
         let (file_path, table_name) = self.resolve_file_path(table_ref, span)?;
-        let table = DataTable::from_file(&file_path).map_err(|e| RuntimeError {
-            message: e,
-            span,
-        })?;
+        let table =
+            DataTable::from_file(&file_path).map_err(|e| RuntimeError { message: e, span })?;
 
         // Validate columns exist
         let use_all = columns.len() == 1 && columns[0] == "*";
@@ -904,7 +1068,8 @@ impl Interpreter {
         }
 
         // Busca un struct declarado cuyo fields coincidan con las columnas seleccionadas
-        let struct_name = self.find_matching_struct(&table.headers, columns)
+        let struct_name = self
+            .find_matching_struct(&table.headers, columns)
             .unwrap_or_else(|| table_name.clone());
 
         let mut results = Vec::new();
@@ -922,17 +1087,27 @@ impl Interpreter {
 
                 match result? {
                     Value::Bool(b) => b,
-                    other => return Err(RuntimeError {
-                        message: format!("WHERE condition must be bool, got '{}'", other.type_name()),
-                        span,
-                    }),
+                    other => {
+                        return Err(RuntimeError {
+                            message: format!(
+                                "WHERE condition must be bool, got '{}'",
+                                other.type_name()
+                            ),
+                            span,
+                        })
+                    }
                 }
             } else {
                 true // No WHERE = todas las filas coinciden
             };
 
             if matches {
-                let row_value = Self::row_to_struct(&struct_name, &table.headers, &table.rows[row_idx], columns);
+                let row_value = Self::row_to_struct(
+                    &struct_name,
+                    &table.headers,
+                    &table.rows[row_idx],
+                    columns,
+                );
                 if single {
                     return Ok(row_value);
                 }
@@ -960,10 +1135,7 @@ impl Interpreter {
 
         // Read existing table
         let mut table = if file_path.exists() {
-            DataTable::from_file(&file_path).map_err(|e| RuntimeError {
-                message: e,
-                span,
-            })?
+            DataTable::from_file(&file_path).map_err(|e| RuntimeError { message: e, span })?
         } else {
             return Err(RuntimeError {
                 message: format!("file '{}' does not exist", file_path.display()),
@@ -980,10 +1152,12 @@ impl Interpreter {
                 Value::Float(v) => v.to_string(),
                 Value::Bool(v) => v.to_string(),
                 Value::Str(v) => v,
-                _ => return Err(RuntimeError {
-                    message: format!("cannot insert value of type '{}'", val.type_name()),
-                    span,
-                }),
+                _ => {
+                    return Err(RuntimeError {
+                        message: format!("cannot insert value of type '{}'", val.type_name()),
+                        span,
+                    })
+                }
             };
             row_values.push(s);
         }
@@ -1001,7 +1175,13 @@ impl Interpreter {
 
     // --- Binary ops ---
 
-    fn eval_binary_op(&self, op: &BinaryOp, left: Value, right: Value, span: Span) -> Result<Value, RuntimeError> {
+    fn eval_binary_op(
+        &self,
+        op: &BinaryOp,
+        left: Value,
+        right: Value,
+        span: Span,
+    ) -> Result<Value, RuntimeError> {
         match op {
             // Arithmetic
             BinaryOp::Add => match (left, right) {
@@ -1015,48 +1195,71 @@ impl Interpreter {
                     span,
                 }),
             },
-            BinaryOp::Sub => self.numeric_op(left, right, span, "subtract", |a, b| a - b, |a, b| a - b),
-            BinaryOp::Mul => self.numeric_op(left, right, span, "multiply", |a, b| a * b, |a, b| a * b),
+            BinaryOp::Sub => {
+                self.numeric_op(left, right, span, "subtract", |a, b| a - b, |a, b| a - b)
+            }
+            BinaryOp::Mul => {
+                self.numeric_op(left, right, span, "multiply", |a, b| a * b, |a, b| a * b)
+            }
             BinaryOp::Div => {
                 // Check for division by zero
                 match (&left, &right) {
-                    (_, Value::Int(0)) => return Err(RuntimeError {
-                        message: "division by zero".to_string(),
-                        span,
-                    }),
-                    (_, Value::Float(f)) if *f == 0.0 => return Err(RuntimeError {
-                        message: "division by zero".to_string(),
-                        span,
-                    }),
+                    (_, Value::Int(0)) => {
+                        return Err(RuntimeError {
+                            message: "division by zero".to_string(),
+                            span,
+                        })
+                    }
+                    (_, Value::Float(f)) if *f == 0.0 => {
+                        return Err(RuntimeError {
+                            message: "division by zero".to_string(),
+                            span,
+                        })
+                    }
                     _ => {}
                 }
                 self.numeric_op(left, right, span, "divide", |a, b| a / b, |a, b| a / b)
             }
             BinaryOp::Mod => {
                 match (&left, &right) {
-                    (_, Value::Int(0)) => return Err(RuntimeError {
-                        message: "modulo by zero".to_string(),
-                        span,
-                    }),
+                    (_, Value::Int(0)) => {
+                        return Err(RuntimeError {
+                            message: "modulo by zero".to_string(),
+                            span,
+                        })
+                    }
                     _ => {}
                 }
                 self.numeric_op(left, right, span, "modulo", |a, b| a % b, |a, b| a % b)
             }
 
-            // Comparison
-            BinaryOp::Eq => self.comparison_op(left, right, span, |ord| ord == std::cmp::Ordering::Equal),
-            BinaryOp::Neq => self.comparison_op(left, right, span, |ord| ord != std::cmp::Ordering::Equal),
-            BinaryOp::Lt => self.comparison_op(left, right, span, |ord| ord == std::cmp::Ordering::Less),
-            BinaryOp::Lte => self.comparison_op(left, right, span, |ord| ord != std::cmp::Ordering::Greater),
-            BinaryOp::Gt => self.comparison_op(left, right, span, |ord| ord == std::cmp::Ordering::Greater),
-            BinaryOp::Gte => self.comparison_op(left, right, span, |ord| ord != std::cmp::Ordering::Less),
+            // Igualdad — funciona con cualquier Value
+            BinaryOp::Eq => Ok(Value::Bool(left == right)),
+            BinaryOp::Neq => Ok(Value::Bool(left != right)),
+            // Orden — solo tipos ordenables (numéricos y string)
+            BinaryOp::Lt => {
+                self.comparison_op(left, right, span, |ord| ord == std::cmp::Ordering::Less)
+            }
+            BinaryOp::Lte => {
+                self.comparison_op(left, right, span, |ord| ord != std::cmp::Ordering::Greater)
+            }
+            BinaryOp::Gt => {
+                self.comparison_op(left, right, span, |ord| ord == std::cmp::Ordering::Greater)
+            }
+            BinaryOp::Gte => {
+                self.comparison_op(left, right, span, |ord| ord != std::cmp::Ordering::Less)
+            }
 
             BinaryOp::And | BinaryOp::Or => unreachable!("handled in evaluate_expr"),
         }
     }
 
     fn numeric_op(
-        &self, left: Value, right: Value, span: Span, op_name: &str,
+        &self,
+        left: Value,
+        right: Value,
+        span: Span,
+        op_name: &str,
         int_op: impl Fn(i64, i64) -> i64,
         float_op: impl Fn(f64, f64) -> f64,
     ) -> Result<Value, RuntimeError> {
@@ -1066,47 +1269,78 @@ impl Interpreter {
             (Value::Int(a), Value::Float(b)) => Ok(Value::Float(float_op(a as f64, b))),
             (Value::Float(a), Value::Int(b)) => Ok(Value::Float(float_op(a, b as f64))),
             (a, b) => Err(RuntimeError {
-                message: format!("cannot {} '{}' and '{}'", op_name, a.type_name(), b.type_name()),
+                message: format!(
+                    "cannot {} '{}' and '{}'",
+                    op_name,
+                    a.type_name(),
+                    b.type_name()
+                ),
                 span,
             }),
         }
     }
 
     fn comparison_op(
-        &self, left: Value, right: Value, span: Span,
+        &self,
+        left: Value,
+        right: Value,
+        span: Span,
         cmp: impl Fn(std::cmp::Ordering) -> bool,
     ) -> Result<Value, RuntimeError> {
         let ordering = match (&left, &right) {
             (Value::Int(a), Value::Int(b)) => a.cmp(b),
-            (Value::Float(a), Value::Float(b)) => a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal),
-            (Value::Int(a), Value::Float(b)) => (*a as f64).partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal),
-            (Value::Float(a), Value::Int(b)) => a.partial_cmp(&(*b as f64)).unwrap_or(std::cmp::Ordering::Equal),
+            (Value::Float(a), Value::Float(b)) => {
+                a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+            }
+            (Value::Int(a), Value::Float(b)) => (*a as f64)
+                .partial_cmp(b)
+                .unwrap_or(std::cmp::Ordering::Equal),
+            (Value::Float(a), Value::Int(b)) => a
+                .partial_cmp(&(*b as f64))
+                .unwrap_or(std::cmp::Ordering::Equal),
             (Value::Str(a), Value::Str(b)) => a.cmp(b),
             (Value::Bool(a), Value::Bool(b)) => a.cmp(b),
-            _ => return Err(RuntimeError {
-                message: format!("cannot compare '{}' and '{}'", left.type_name(), right.type_name()),
-                span,
-            }),
+            _ => {
+                return Err(RuntimeError {
+                    message: format!(
+                        "cannot compare '{}' and '{}'",
+                        left.type_name(),
+                        right.type_name()
+                    ),
+                    span,
+                })
+            }
         };
         Ok(Value::Bool(cmp(ordering)))
     }
 
-    fn call_function(&mut self, name: &str, args: Vec<Value>, span: Span) -> Result<Value, RuntimeError> {
+    fn call_function(
+        &mut self,
+        name: &str,
+        args: Vec<Value>,
+        span: Span,
+    ) -> Result<Value, RuntimeError> {
         // Primero busca funciones nativas
         if let Some(native_fn) = self.native_functions.get(name) {
             return native_fn(args);
         }
 
-        let func = self.functions.get(name).cloned().ok_or_else(|| RuntimeError {
-            message: format!("undefined function '{}'", name),
-            span,
-        })?;
+        let func = self
+            .functions
+            .get(name)
+            .cloned()
+            .ok_or_else(|| RuntimeError {
+                message: format!("undefined function '{}'", name),
+                span,
+            })?;
 
         if args.len() != func.params.len() {
             return Err(RuntimeError {
                 message: format!(
                     "function '{}' expects {} arguments, got {}",
-                    name, func.params.len(), args.len()
+                    name,
+                    func.params.len(),
+                    args.len()
                 ),
                 span,
             });
@@ -1127,16 +1361,23 @@ impl Interpreter {
         }
     }
 
-    fn check_type_compat(&self, value: &Value, type_ann: &TypeAnnotation, span: Span) -> Result<(), RuntimeError> {
+    fn check_type_compat(
+        &self,
+        value: &Value,
+        type_ann: &TypeAnnotation,
+        span: Span,
+    ) -> Result<(), RuntimeError> {
         let compatible = match (value, type_ann) {
             (Value::Int(_), TypeAnnotation::Int) => true,
             (Value::Float(_), TypeAnnotation::Float) => true,
             (Value::Bool(_), TypeAnnotation::Bool) => true,
             (Value::Str(_), TypeAnnotation::StringType) => true,
             (Value::Void, TypeAnnotation::Void) => true,
-            (Value::StructInstance { type_name, .. }, TypeAnnotation::UserDefined(name)) => type_name == name,
+            (Value::StructInstance { type_name, .. }, TypeAnnotation::UserDefined(name)) => {
+                type_name == name
+            }
             (Value::List(_), TypeAnnotation::List(_)) => true,
-            (Value::List(_), TypeAnnotation::UserDefined(_)) => true,  // Lists from SQL are loosely typed
+            (Value::List(_), TypeAnnotation::UserDefined(_)) => true, // Lists from SQL are loosely typed
             // Allow int -> float promotion in let bindings
             (Value::Int(_), TypeAnnotation::Float) => true,
             _ => false,
@@ -1165,7 +1406,11 @@ impl Interpreter {
             TypeAnnotation::Void => "void".to_string(),
             TypeAnnotation::List(inner) => format!("list<{}>", Self::type_ann_name(inner)),
             TypeAnnotation::Result(ok_t, err_t) => {
-                format!("Result<{}, {}>", Self::type_ann_name(ok_t), Self::type_ann_name(err_t))
+                format!(
+                    "Result<{}, {}>",
+                    Self::type_ann_name(ok_t),
+                    Self::type_ann_name(err_t)
+                )
             }
             TypeAnnotation::Option(inner) => format!("Option<{}>", Self::type_ann_name(inner)),
             TypeAnnotation::UserDefined(name) => name.clone(),
@@ -1178,29 +1423,48 @@ impl Interpreter {
 fn native_err_arg(name: &str, expected: usize, got: usize) -> RuntimeError {
     RuntimeError {
         message: format!("'{}' expects {} argument(s), got {}", name, expected, got),
-        span: Span { line: 0, column: 0, start: 0, end: 0 },
+        span: Span {
+            line: 0,
+            column: 0,
+            start: 0,
+            end: 0,
+        },
     }
 }
 
 fn native_type_of(args: Vec<Value>) -> Result<Value, RuntimeError> {
-    if args.len() != 1 { return Err(native_err_arg("typeOf", 1, args.len())); }
+    if args.len() != 1 {
+        return Err(native_err_arg("typeOf", 1, args.len()));
+    }
     Ok(Value::Str(args[0].type_name().to_string()))
 }
 
 fn native_len(args: Vec<Value>) -> Result<Value, RuntimeError> {
-    if args.len() != 1 { return Err(native_err_arg("len", 1, args.len())); }
+    if args.len() != 1 {
+        return Err(native_err_arg("len", 1, args.len()));
+    }
     match &args[0] {
         Value::List(items) => Ok(Value::Int(items.len() as i64)),
-        Value::Str(s)      => Ok(Value::Int(s.chars().count() as i64)),
+        Value::Str(s) => Ok(Value::Int(s.chars().count() as i64)),
         other => Err(RuntimeError {
-            message: format!("'len' expects a list or string, got '{}'", other.type_name()),
-            span: Span { line: 0, column: 0, start: 0, end: 0 },
+            message: format!(
+                "'len' expects a list or string, got '{}'",
+                other.type_name()
+            ),
+            span: Span {
+                line: 0,
+                column: 0,
+                start: 0,
+                end: 0,
+            },
         }),
     }
 }
 
 fn native_push(mut args: Vec<Value>) -> Result<Value, RuntimeError> {
-    if args.len() != 2 { return Err(native_err_arg("push", 2, args.len())); }
+    if args.len() != 2 {
+        return Err(native_err_arg("push", 2, args.len()));
+    }
     let elem = args.pop().unwrap();
     let list = args.pop().unwrap();
     match list {
@@ -1209,20 +1473,35 @@ fn native_push(mut args: Vec<Value>) -> Result<Value, RuntimeError> {
             Ok(Value::List(items))
         }
         other => Err(RuntimeError {
-            message: format!("'push' expects a list as first argument, got '{}'", other.type_name()),
-            span: Span { line: 0, column: 0, start: 0, end: 0 },
+            message: format!(
+                "'push' expects a list as first argument, got '{}'",
+                other.type_name()
+            ),
+            span: Span {
+                line: 0,
+                column: 0,
+                start: 0,
+                end: 0,
+            },
         }),
     }
 }
 
 fn native_pop(args: Vec<Value>) -> Result<Value, RuntimeError> {
-    if args.len() != 1 { return Err(native_err_arg("pop", 1, args.len())); }
+    if args.len() != 1 {
+        return Err(native_err_arg("pop", 1, args.len()));
+    }
     match &args[0] {
         Value::List(items) => {
             if items.is_empty() {
                 return Err(RuntimeError {
                     message: "'pop' called on empty list".to_string(),
-                    span: Span { line: 0, column: 0, start: 0, end: 0 },
+                    span: Span {
+                        line: 0,
+                        column: 0,
+                        start: 0,
+                        end: 0,
+                    },
                 });
             }
             let mut new_items = items.clone();
@@ -1231,108 +1510,1014 @@ fn native_pop(args: Vec<Value>) -> Result<Value, RuntimeError> {
         }
         other => Err(RuntimeError {
             message: format!("'pop' expects a list, got '{}'", other.type_name()),
-            span: Span { line: 0, column: 0, start: 0, end: 0 },
+            span: Span {
+                line: 0,
+                column: 0,
+                start: 0,
+                end: 0,
+            },
         }),
     }
 }
 
 fn native_to_string(args: Vec<Value>) -> Result<Value, RuntimeError> {
-    if args.len() != 1 { return Err(native_err_arg("toString", 1, args.len())); }
+    if args.len() != 1 {
+        return Err(native_err_arg("toString", 1, args.len()));
+    }
     Ok(Value::Str(args[0].to_display_string()))
 }
 
 fn native_parse_int(args: Vec<Value>) -> Result<Value, RuntimeError> {
-    if args.len() != 1 { return Err(native_err_arg("parseInt", 1, args.len())); }
+    if args.len() != 1 {
+        return Err(native_err_arg("parseInt", 1, args.len()));
+    }
     match &args[0] {
-        Value::Str(s) => s.trim().parse::<i64>()
+        Value::Str(s) => s
+            .trim()
+            .parse::<i64>()
             .map(Value::Int)
             .map_err(|_| RuntimeError {
                 message: format!("'parseInt' cannot parse '{}' as int", s),
-                span: Span { line: 0, column: 0, start: 0, end: 0 },
+                span: Span {
+                    line: 0,
+                    column: 0,
+                    start: 0,
+                    end: 0,
+                },
             }),
         Value::Int(i) => Ok(Value::Int(*i)),
         other => Err(RuntimeError {
             message: format!("'parseInt' expects a string, got '{}'", other.type_name()),
-            span: Span { line: 0, column: 0, start: 0, end: 0 },
+            span: Span {
+                line: 0,
+                column: 0,
+                start: 0,
+                end: 0,
+            },
         }),
     }
 }
 
 fn native_parse_float(args: Vec<Value>) -> Result<Value, RuntimeError> {
-    if args.len() != 1 { return Err(native_err_arg("toFloat", 1, args.len())); }
+    if args.len() != 1 {
+        return Err(native_err_arg("toFloat", 1, args.len()));
+    }
     match &args[0] {
-        Value::Str(s) => s.trim().parse::<f64>()
+        Value::Str(s) => s
+            .trim()
+            .parse::<f64>()
             .map(Value::Float)
             .map_err(|_| RuntimeError {
                 message: format!("'toFloat' cannot parse '{}' as float", s),
-                span: Span { line: 0, column: 0, start: 0, end: 0 },
+                span: Span {
+                    line: 0,
+                    column: 0,
+                    start: 0,
+                    end: 0,
+                },
             }),
         Value::Float(f) => Ok(Value::Float(*f)),
-        Value::Int(i)   => Ok(Value::Float(*i as f64)),
+        Value::Int(i) => Ok(Value::Float(*i as f64)),
         other => Err(RuntimeError {
             message: format!("'toFloat' expects a string, got '{}'", other.type_name()),
-            span: Span { line: 0, column: 0, start: 0, end: 0 },
+            span: Span {
+                line: 0,
+                column: 0,
+                start: 0,
+                end: 0,
+            },
         }),
     }
 }
 
 fn native_ok(args: Vec<Value>) -> Result<Value, RuntimeError> {
-    if args.len() != 1 { return Err(native_err_arg("ok", 1, args.len())); }
+    if args.len() != 1 {
+        return Err(native_err_arg("ok", 1, args.len()));
+    }
     Ok(Value::Ok(Box::new(args.into_iter().next().unwrap())))
 }
 
 fn native_err(args: Vec<Value>) -> Result<Value, RuntimeError> {
-    if args.len() != 1 { return Err(native_err_arg("err", 1, args.len())); }
+    if args.len() != 1 {
+        return Err(native_err_arg("err", 1, args.len()));
+    }
     Ok(Value::Err(Box::new(args.into_iter().next().unwrap())))
 }
 
 fn native_some(args: Vec<Value>) -> Result<Value, RuntimeError> {
-    if args.len() != 1 { return Err(native_err_arg("some", 1, args.len())); }
+    if args.len() != 1 {
+        return Err(native_err_arg("some", 1, args.len()));
+    }
     Ok(Value::Some(Box::new(args.into_iter().next().unwrap())))
 }
 
 fn native_none(args: Vec<Value>) -> Result<Value, RuntimeError> {
-    if !args.is_empty() { return Err(native_err_arg("none", 0, args.len())); }
+    if !args.is_empty() {
+        return Err(native_err_arg("none", 0, args.len()));
+    }
     Ok(Value::None)
 }
 
 fn native_unwrap(args: Vec<Value>) -> Result<Value, RuntimeError> {
-    if args.len() != 1 { return Err(native_err_arg("unwrap", 1, args.len())); }
+    if args.len() != 1 {
+        return Err(native_err_arg("unwrap", 1, args.len()));
+    }
     match args.into_iter().next().unwrap() {
         Value::Ok(inner) | Value::Some(inner) => Ok(*inner),
         Value::Err(e) => Err(RuntimeError {
             message: format!("unwrap called on err({})", e.to_display_string()),
-            span: Span { line: 0, column: 0, start: 0, end: 0 },
+            span: Span {
+                line: 0,
+                column: 0,
+                start: 0,
+                end: 0,
+            },
         }),
         Value::None => Err(RuntimeError {
             message: "unwrap called on none".to_string(),
-            span: Span { line: 0, column: 0, start: 0, end: 0 },
+            span: Span {
+                line: 0,
+                column: 0,
+                start: 0,
+                end: 0,
+            },
         }),
         other => Err(RuntimeError {
-            message: format!("'unwrap' expects Result or Option, got '{}'", other.type_name()),
-            span: Span { line: 0, column: 0, start: 0, end: 0 },
+            message: format!(
+                "'unwrap' expects Result or Option, got '{}'",
+                other.type_name()
+            ),
+            span: Span {
+                line: 0,
+                column: 0,
+                start: 0,
+                end: 0,
+            },
         }),
     }
 }
 
 fn native_is_ok(args: Vec<Value>) -> Result<Value, RuntimeError> {
-    if args.len() != 1 { return Err(native_err_arg("is_ok", 1, args.len())); }
+    if args.len() != 1 {
+        return Err(native_err_arg("is_ok", 1, args.len()));
+    }
     Ok(Value::Bool(matches!(args[0], Value::Ok(_))))
 }
 
 fn native_is_err(args: Vec<Value>) -> Result<Value, RuntimeError> {
-    if args.len() != 1 { return Err(native_err_arg("is_err", 1, args.len())); }
+    if args.len() != 1 {
+        return Err(native_err_arg("is_err", 1, args.len()));
+    }
     Ok(Value::Bool(matches!(args[0], Value::Err(_))))
 }
 
 fn native_is_some(args: Vec<Value>) -> Result<Value, RuntimeError> {
-    if args.len() != 1 { return Err(native_err_arg("is_some", 1, args.len())); }
+    if args.len() != 1 {
+        return Err(native_err_arg("is_some", 1, args.len()));
+    }
     Ok(Value::Bool(matches!(args[0], Value::Some(_))))
 }
 
 fn native_is_none(args: Vec<Value>) -> Result<Value, RuntimeError> {
-    if args.len() != 1 { return Err(native_err_arg("is_none", 1, args.len())); }
+    if args.len() != 1 {
+        return Err(native_err_arg("is_none", 1, args.len()));
+    }
     Ok(Value::Bool(matches!(args[0], Value::None)))
+}
+
+fn native_split(args: Vec<Value>) -> Result<Value, RuntimeError> {
+    match args.len() {
+        1 => {
+            let parts = match &args[0] {
+                Value::Str(s) => s
+                    .split(" ")
+                    .map(|part| Value::Str(part.to_string()))
+                    .collect(),
+                other => {
+                    return Err(RuntimeError {
+                        message: format!(
+                            "'split' expects a string as first argument, got '{}'",
+                            other.type_name()
+                        ),
+                        span: Span {
+                            line: 0,
+                            column: 0,
+                            start: 0,
+                            end: 0,
+                        },
+                    })
+                }
+            };
+            return Ok(Value::List(parts));
+        } // default delimiter: space
+        2 => match (&args[0], &args[1]) {
+            (Value::Str(s), Value::Str(delim)) => {
+                let parts = s
+                    .split(delim)
+                    .map(|part| Value::Str(part.to_string()))
+                    .collect();
+                Ok(Value::List(parts))
+            }
+            (a, b) => Err(RuntimeError {
+                message: format!(
+                    "'split' expects two strings, got '{}' and '{}'",
+                    a.type_name(),
+                    b.type_name()
+                ),
+                span: Span {
+                    line: 0,
+                    column: 0,
+                    start: 0,
+                    end: 0,
+                },
+            }),
+        }, // ok
+        _ => {
+            return Err(native_err_arg("split", 2, args.len()));
+        }
+    }
+}
+
+fn native_trim(args: Vec<Value>) -> Result<Value, RuntimeError> {
+    if args.len() != 1 {
+        return Err(native_err_arg("trim", 1, args.len()));
+    }
+    match &args[0] {
+        Value::Str(s) => Ok(Value::Str(s.trim().to_string())),
+        other => Err(RuntimeError {
+            message: format!(
+                "'trim' expects a string as first argument, got '{}'",
+                other.type_name()
+            ),
+            span: Span {
+                line: 0,
+                column: 0,
+                start: 0,
+                end: 0,
+            },
+        }),
+    }
+}
+
+fn native_contains(args: Vec<Value>) -> Result<Value, RuntimeError> {
+    if args.len() != 2 {
+        return Err(native_err_arg("contains", 2, args.len()));
+    }
+    match (&args[0], &args[1]) {
+        (Value::Str(s), Value::Str(substr)) => Ok(Value::Bool(s.contains(substr))),
+        (Value::List(items), item) => Ok(Value::Bool(items.iter().any(|i| i == item))),
+        (a, b) => Err(RuntimeError {
+            message: format!(
+                "'contains' expects two values, got '{}' and '{}'",
+                a.type_name(),
+                b.type_name()
+            ),
+            span: Span {
+                line: 0,
+                column: 0,
+                start: 0,
+                end: 0,
+            },
+        }),
+    }
+}
+
+fn native_lower(args: Vec<Value>) -> Result<Value, RuntimeError> {
+    if args.len() != 1 {
+        return Err(native_err_arg("lower", 1, args.len()));
+    }
+    match &args[0] {
+        Value::Str(s) => Ok(Value::Str(s.to_lowercase())),
+        other => Err(RuntimeError {
+            message: format!(
+                "'lower' expects a string as first argument, got '{}'",
+                other.type_name()
+            ),
+            span: Span {
+                line: 0,
+                column: 0,
+                start: 0,
+                end: 0,
+            },
+        }),
+    }
+}
+
+fn native_upper(args: Vec<Value>) -> Result<Value, RuntimeError> {
+    if args.len() != 1 {
+        return Err(native_err_arg("upper", 1, args.len()));
+    }
+    match &args[0] {
+        Value::Str(s) => Ok(Value::Str(s.to_uppercase())),
+        other => Err(RuntimeError {
+            message: format!(
+                "'upper' expects a string as first argument, got '{}'",
+                other.type_name()
+            ),
+            span: Span {
+                line: 0,
+                column: 0,
+                start: 0,
+                end: 0,
+            },
+        }),
+    }
+}
+
+fn native_replace(args: Vec<Value>) -> Result<Value, RuntimeError> {
+    if args.len() != 3 {
+        return Err(native_err_arg("replace", 3, args.len()));
+    }
+    match (&args[0], &args[1], &args[2]) {
+        (Value::Str(s), Value::Str(from), Value::Str(to)) => Ok(Value::Str(s.replace(from, to))),
+        (a, b, c) => Err(RuntimeError {
+            message: format!(
+                "'replace' expects three strings, got '{}', '{}' and '{}'",
+                a.type_name(),
+                b.type_name(),
+                c.type_name()
+            ),
+            span: Span {
+                line: 0,
+                column: 0,
+                start: 0,
+                end: 0,
+            },
+        }),
+    }
+}
+
+fn native_ends_with(args: Vec<Value>) -> Result<Value, RuntimeError> {
+    if args.len() != 2 {
+        return Err(native_err_arg("endsWith", 2, args.len()));
+    }
+    match (&args[0], &args[1]) {
+        (Value::Str(s), Value::Str(suffix)) => Ok(Value::Bool(s.ends_with(suffix))),
+        (a, b) => Err(RuntimeError {
+            message: format!(
+                "'endsWith' expects two strings, got '{}' and '{}'",
+                a.type_name(),
+                b.type_name()
+            ),
+            span: Span {
+                line: 0,
+                column: 0,
+                start: 0,
+                end: 0,
+            },
+        }),
+    }
+}
+
+fn native_starts_with(args: Vec<Value>) -> Result<Value, RuntimeError> {
+    if args.len() != 2 {
+        return Err(native_err_arg("startsWith", 2, args.len()));
+    }
+    match (&args[0], &args[1]) {
+        (Value::Str(s), Value::Str(prefix)) => Ok(Value::Bool(s.starts_with(prefix))),
+        (a, b) => Err(RuntimeError {
+            message: format!(
+                "'startsWith' expects two strings, got '{}' and '{}'",
+                a.type_name(),
+                b.type_name()
+            ),
+            span: Span {
+                line: 0,
+                column: 0,
+                start: 0,
+                end: 0,
+            },
+        }),
+    }
+}
+
+fn native_substring(args: Vec<Value>) -> Result<Value, RuntimeError> {
+    if args.len() != 3 {
+        return Err(native_err_arg("substring", 3, args.len()));
+    }
+    match (&args[0], &args[1], &args[2]) {
+        (Value::Str(s), Value::Int(start), Value::Int(len)) => {
+            let start = *start as usize;
+            let len = *len as usize;
+            if start >= s.len() {
+                return Ok(Value::Str("".to_string()));
+            }
+            let end = std::cmp::min(start + len, s.len());
+            Ok(Value::Str(s[start..end].to_string()))
+        }
+        (a, b, c) => Err(RuntimeError {
+            message: format!(
+                "'substring' expects a string and two ints, got '{}', '{}' and '{}'",
+                a.type_name(),
+                b.type_name(),
+                c.type_name()
+            ),
+            span: Span {
+                line: 0,
+                column: 0,
+                start: 0,
+                end: 0,
+            },
+        }),
+    }
+}
+
+fn native_abs(args: Vec<Value>) -> Result<Value, RuntimeError> {
+    if args.len() != 1 {
+        return Err(native_err_arg("abs", 1, args.len()));
+    }
+    match &args[0] {
+        Value::Int(i) => Ok(Value::Int(i.abs())),
+        Value::Float(f) => Ok(Value::Float(f.abs())),
+        other => Err(RuntimeError {
+            message: format!("'abs' expects a number, got '{}'", other.type_name()),
+            span: Span {
+                line: 0,
+                column: 0,
+                start: 0,
+                end: 0,
+            },
+        }),
+    }
+}
+fn native_pow(args: Vec<Value>) -> Result<Value, RuntimeError> {
+    if args.len() != 2 {
+        return Err(native_err_arg("pow", 2, args.len()));
+    }
+    match (&args[0], &args[1]) {
+        (Value::Int(base), Value::Int(exp)) => Ok(Value::Int(base.pow(*exp as u32))),
+        (Value::Float(base), Value::Float(exp)) => Ok(Value::Float(base.powf(*exp))),
+        (Value::Int(base), Value::Float(exp)) => Ok(Value::Float((*base as f64).powf(*exp))),
+        (Value::Float(base), Value::Int(exp)) => Ok(Value::Float(base.powf(*exp as f64))),
+        (a, b) => Err(RuntimeError {
+            message: format!(
+                "'pow' expects two numbers, got '{}' and '{}'",
+                a.type_name(),
+                b.type_name()
+            ),
+            span: Span {
+                line: 0,
+                column: 0,
+                start: 0,
+                end: 0,
+            },
+        }),
+    }
+}
+fn native_powf(args: Vec<Value>) -> Result<Value, RuntimeError> {
+    if args.len() != 2 {
+        return Err(native_err_arg("powf", 2, args.len()));
+    }
+    match (&args[0], &args[1]) {
+        (Value::Int(base), Value::Int(exp)) => Ok(Value::Float((*base as f64).powf(*exp as f64))),
+        (Value::Float(base), Value::Float(exp)) => Ok(Value::Float(base.powf(*exp))),
+        (Value::Int(base), Value::Float(exp)) => Ok(Value::Float((*base as f64).powf(*exp))),
+        (Value::Float(base), Value::Int(exp)) => Ok(Value::Float(base.powf(*exp as f64))),
+        (a, b) => Err(RuntimeError {
+            message: format!(
+                "'powf' expects two numbers, got '{}' and '{}'",
+                a.type_name(),
+                b.type_name()
+            ),
+            span: Span {
+                line: 0,
+                column: 0,
+                start: 0,
+                end: 0,
+            },
+        }),
+    }
+}
+
+fn native_exp(args: Vec<Value>) -> Result<Value, RuntimeError> {
+    if args.len() != 1 {
+        return Err(native_err_arg("exp", 1, args.len()));
+    }
+    match &args[0] {
+        Value::Int(i) => Ok(Value::Float((*i as f64).exp())),
+        Value::Float(f) => Ok(Value::Float(f.exp())),
+        other => Err(RuntimeError {
+            message: format!("'exp' expects a number, got '{}'", other.type_name()),
+            span: Span {
+                line: 0,
+                column: 0,
+                start: 0,
+                end: 0,
+            },
+        }),
+    }
+}
+
+fn native_ln(args: Vec<Value>) -> Result<Value, RuntimeError> {
+    if args.len() != 1 {
+        return Err(native_err_arg("ln", 1, args.len()));
+    }
+    match &args[0] {
+        Value::Int(i) => {
+            if *i <= 0 {
+                return Err(RuntimeError {
+                    message: format!("'ln' cannot take non-positive number, got {}", i),
+                    span: Span {
+                        line: 0,
+                        column: 0,
+                        start: 0,
+                        end: 0,
+                    },
+                });
+            }
+            Ok(Value::Float((*i as f64).ln()))
+        }
+        Value::Float(f) => {
+            if *f <= 0.0 {
+                return Err(RuntimeError {
+                    message: format!("'ln' cannot take non-positive number, got {}", f),
+                    span: Span {
+                        line: 0,
+                        column: 0,
+                        start: 0,
+                        end: 0,
+                    },
+                });
+            }
+            Ok(Value::Float(f.ln()))
+        }
+        other => Err(RuntimeError {
+            message: format!("'ln' expects a number, got '{}'", other.type_name()),
+            span: Span {
+                line: 0,
+                column: 0,
+                start: 0,
+                end: 0,
+            },
+        }),
+    }
+}
+
+fn native_log10(args: Vec<Value>) -> Result<Value, RuntimeError> {
+    if args.len() != 1 {
+        return Err(native_err_arg("log10", 1, args.len()));
+    }
+    match &args[0] {
+        Value::Int(i) => {
+            if *i <= 0 {
+                return Err(RuntimeError {
+                    message: format!("'log10' cannot take non-positive number, got {}", i),
+                    span: Span {
+                        line: 0,
+                        column: 0,
+                        start: 0,
+                        end: 0,
+                    },
+                });
+            }
+            Ok(Value::Float((*i as f64).log10()))
+        }
+        Value::Float(f) => {
+            if *f <= 0.0 {
+                return Err(RuntimeError {
+                    message: format!("'log10' cannot take non-positive number, got {}", f),
+                    span: Span {
+                        line: 0,
+                        column: 0,
+                        start: 0,
+                        end: 0,
+                    },
+                });
+            }
+            Ok(Value::Float(f.log10()))
+        }
+        other => Err(RuntimeError {
+            message: format!("'log10' expects a number, got '{}'", other.type_name()),
+            span: Span {
+                line: 0,
+                column: 0,
+                start: 0,
+                end: 0,
+            },
+        }),
+    }
+}
+
+fn native_log2(args: Vec<Value>) -> Result<Value, RuntimeError> {
+    if args.len() != 1 {
+        return Err(native_err_arg("log2", 1, args.len()));
+    }
+    match &args[0] {
+        Value::Int(i) => {
+            if *i <= 0 {
+                return Err(RuntimeError {
+                    message: format!("'log2' cannot take non-positive number, got {}", i),
+                    span: Span {
+                        line: 0,
+                        column: 0,
+                        start: 0,
+                        end: 0,
+                    },
+                });
+            }
+            Ok(Value::Float((*i as f64).log2()))
+        }
+        Value::Float(f) => {
+            if *f <= 0.0 {
+                return Err(RuntimeError {
+                    message: format!("'log2' cannot take non-positive number, got {}", f),
+                    span: Span {
+                        line: 0,
+                        column: 0,
+                        start: 0,
+                        end: 0,
+                    },
+                });
+            }
+            Ok(Value::Float(f.log2()))
+        }
+        other => Err(RuntimeError {
+            message: format!("'log2' expects a number, got '{}'", other.type_name()),
+            span: Span {
+                line: 0,
+                column: 0,
+                start: 0,
+                end: 0,
+            },
+        }),
+    }
+}
+
+fn native_log(args: Vec<Value>) -> Result<Value, RuntimeError> {
+    if args.len() != 1 {
+        return Err(native_err_arg("log", 1, args.len()));
+    }
+    match &args[0] {
+        Value::Int(i) => {
+            if *i <= 0 {
+                return Err(RuntimeError {
+                    message: format!("'log' cannot take non-positive number, got {}", i),
+                    span: Span {
+                        line: 0,
+                        column: 0,
+                        start: 0,
+                        end: 0,
+                    },
+                });
+            }
+            Ok(Value::Float((*i as f64).ln()))
+        }
+        Value::Float(f) => {
+            if *f <= 0.0 {
+                return Err(RuntimeError {
+                    message: format!("'log' cannot take non-positive number, got {}", f),
+                    span: Span {
+                        line: 0,
+                        column: 0,
+                        start: 0,
+                        end: 0,
+                    },
+                });
+            }
+            Ok(Value::Float(f.ln()))
+        }
+        other => Err(RuntimeError {
+            message: format!("'log' expects a number, got '{}'", other.type_name()),
+            span: Span {
+                line: 0,
+                column: 0,
+                start: 0,
+                end: 0,
+            },
+        }),
+    }
+}
+fn native_sin(args: Vec<Value>) -> Result<Value, RuntimeError> {
+    if args.len() != 1 {
+        return Err(native_err_arg("sin", 1, args.len()));
+    }
+    match &args[0] {
+        Value::Int(i) => Ok(Value::Float((*i as f64).sin())),
+        Value::Float(f) => Ok(Value::Float(f.sin())),
+        other => Err(RuntimeError {
+            message: format!("'sin' expects a number, got '{}'", other.type_name()),
+            span: Span {
+                line: 0,
+                column: 0,
+                start: 0,
+                end: 0,
+            },
+        }),
+    }
+}
+fn native_cos(args: Vec<Value>) -> Result<Value, RuntimeError> {
+    if args.len() != 1 {
+        return Err(native_err_arg("cos", 1, args.len()));
+    }
+    match &args[0] {
+        Value::Int(i) => Ok(Value::Float((*i as f64).cos())),
+        Value::Float(f) => Ok(Value::Float(f.cos())),
+        other => Err(RuntimeError {
+            message: format!("'cos' expects a number, got '{}'", other.type_name()),
+            span: Span {
+                line: 0,
+                column: 0,
+                start: 0,
+                end: 0,
+            },
+        }),
+    }
+}
+fn native_tan(args: Vec<Value>) -> Result<Value, RuntimeError> {
+    if args.len() != 1 {
+        return Err(native_err_arg("tan", 1, args.len()));
+    }
+    match &args[0] {
+        Value::Int(i) => Ok(Value::Float((*i as f64).tan())),
+        Value::Float(f) => Ok(Value::Float(f.tan())),
+        other => Err(RuntimeError {
+            message: format!("'tan' expects a number, got '{}'", other.type_name()),
+            span: Span {
+                line: 0,
+                column: 0,
+                start: 0,
+                end: 0,
+            },
+        }),
+    }
+}
+
+fn native_sqrt(args: Vec<Value>) -> Result<Value, RuntimeError> {
+    if args.len() != 1 {
+        return Err(native_err_arg("sqrt", 1, args.len()));
+    }
+    match &args[0] {
+        Value::Int(i) => {
+            if *i < 0 {
+                return Err(RuntimeError {
+                    message: format!("'sqrt' cannot take negative number, got {}", i),
+                    span: Span {
+                        line: 0,
+                        column: 0,
+                        start: 0,
+                        end: 0,
+                    },
+                });
+            }
+            Ok(Value::Float((*i as f64).sqrt()))
+        }
+        Value::Float(f) => {
+            if *f < 0.0 {
+                return Err(RuntimeError {
+                    message: format!("'sqrt' cannot take negative number, got {}", f),
+                    span: Span {
+                        line: 0,
+                        column: 0,
+                        start: 0,
+                        end: 0,
+                    },
+                });
+            }
+            Ok(Value::Float(f.sqrt()))
+        }
+        other => Err(RuntimeError {
+            message: format!("'sqrt' expects a number, got '{}'", other.type_name()),
+            span: Span {
+                line: 0,
+                column: 0,
+                start: 0,
+                end: 0,
+            },
+        }),
+    }
+}
+
+fn native_max(args: Vec<Value>) -> Result<Value, RuntimeError> {
+    if args.len() != 2 {
+        return Err(native_err_arg("max", 2, args.len()));
+    }
+    match (&args[0], &args[1]) {
+        (Value::Int(a), Value::Int(b)) => Ok(Value::Int(std::cmp::max(*a, *b))),
+        (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a.max(*b))),
+        (Value::Int(a), Value::Float(b)) => Ok(Value::Float((*a as f64).max(*b))),
+        (Value::Float(a), Value::Int(b)) => Ok(Value::Float(a.max(*b as f64))),
+        (a, b) => Err(RuntimeError {
+            message: format!(
+                "'max' expects two numbers, got '{}' and '{}'",
+                a.type_name(),
+                b.type_name()
+            ),
+            span: Span {
+                line: 0,
+                column: 0,
+                start: 0,
+                end: 0,
+            },
+        }),
+    }
+}
+
+fn native_min(args: Vec<Value>) -> Result<Value, RuntimeError> {
+    if args.len() != 2 {
+        return Err(native_err_arg("min", 2, args.len()));
+    }
+    match (&args[0], &args[1]) {
+        (Value::Int(a), Value::Int(b)) => Ok(Value::Int(std::cmp::min(*a, *b))),
+        (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a.min(*b))),
+        (Value::Int(a), Value::Float(b)) => Ok(Value::Float((*a as f64).min(*b))),
+        (Value::Float(a), Value::Int(b)) => Ok(Value::Float(a.min(*b as f64))),
+        (a, b) => Err(RuntimeError {
+            message: format!(
+                "'min' expects two numbers, got '{}' and '{}'",
+                a.type_name(),
+                b.type_name()
+            ),
+            span: Span {
+                line: 0,
+                column: 0,
+                start: 0,
+                end: 0,
+            },
+        }),
+    }
+}
+
+fn native_range(args: Vec<Value>) -> Result<Value, RuntimeError> {
+    if args.len() != 2 {
+        return Err(native_err_arg("range", 2, args.len()));
+    }
+    match (&args[0], &args[1]) {
+        (Value::Int(start), Value::Int(end)) => {
+            if start > end {
+                return Err(RuntimeError {
+                    message: format!("'range' start must be <= end, got {} and {}", start, end),
+                    span: Span {
+                        line: 0,
+                        column: 0,
+                        start: 0,
+                        end: 0,
+                    },
+                });
+            }
+            let range = (*start..*end).map(Value::Int).collect();
+            Ok(Value::List(range))
+        }
+        (a, b) => Err(RuntimeError {
+            message: format!(
+                "'range' expects two ints, got '{}' and '{}'",
+                a.type_name(),
+                b.type_name()
+            ),
+            span: Span {
+                line: 0,
+                column: 0,
+                start: 0,
+                end: 0,
+            },
+        }),
+    }
+}
+
+fn native_floor(args: Vec<Value>) -> Result<Value, RuntimeError> {
+    if args.len() != 1 {
+        return Err(native_err_arg("floor", 1, args.len()));
+    }
+    match &args[0] {
+        Value::Int(i) => Ok(Value::Int(*i)),
+        Value::Float(f) => Ok(Value::Int(f.floor() as i64)),
+        other => Err(RuntimeError {
+            message: format!("'floor' expects a number, got '{}'", other.type_name()),
+            span: Span {
+                line: 0,
+                column: 0,
+                start: 0,
+                end: 0,
+            },
+        }),
+    }
+}
+
+fn native_round(args: Vec<Value>) -> Result<Value, RuntimeError> {
+    if args.len() != 1 {
+        return Err(native_err_arg("round", 1, args.len()));
+    }
+    match &args[0] {
+        Value::Int(i) => Ok(Value::Int(*i)),
+        Value::Float(f) => Ok(Value::Int(f.round() as i64)),
+        other => Err(RuntimeError {
+            message: format!("'round' expects a number, got '{}'", other.type_name()),
+            span: Span {
+                line: 0,
+                column: 0,
+                start: 0,
+                end: 0,
+            },
+        }),
+    }
+}
+
+fn native_ceil(args: Vec<Value>) -> Result<Value, RuntimeError> {
+    if args.len() != 1 {
+        return Err(native_err_arg("ceil", 1, args.len()));
+    }
+    match &args[0] {
+        Value::Int(i) => Ok(Value::Int(*i)),
+        Value::Float(f) => Ok(Value::Int(f.ceil() as i64)),
+        other => Err(RuntimeError {
+            message: format!("'ceil' expects a number, got '{}'", other.type_name()),
+            span: Span {
+                line: 0,
+                column: 0,
+                start: 0,
+                end: 0,
+            },
+        }),
+    }
+}
+
+fn native_index_of(args: Vec<Value>) -> Result<Value, RuntimeError> {
+    if args.len() != 2 {
+        return Err(native_err_arg("indexOf", 2, args.len()));
+    }
+    match (&args[0], &args[1]) {
+        (Value::Str(s), Value::Str(substr)) => {
+            Ok(Value::Int(s.find(substr).unwrap_or(usize::MAX) as i64))
+        }
+        (a, b) => Err(RuntimeError {
+            message: format!(
+                "'indexOf' expects two strings, got '{}' and '{}'",
+                a.type_name(),
+                b.type_name()
+            ),
+            span: Span {
+                line: 0,
+                column: 0,
+                start: 0,
+                end: 0,
+            },
+        }),
+    }
+}
+
+fn native_last_index_of(args: Vec<Value>) -> Result<Value, RuntimeError> {
+    if args.len() != 2 {
+        return Err(native_err_arg("lastIndexOf", 2, args.len()));
+    }
+    match (&args[0], &args[1]) {
+        (Value::Str(s), Value::Str(substr)) => {
+            Ok(Value::Int(s.rfind(substr).unwrap_or(usize::MAX) as i64))
+        }
+        (a, b) => Err(RuntimeError {
+            message: format!(
+                "'lastIndexOf' expects two strings, got '{}' and '{}'",
+                a.type_name(),
+                b.type_name()
+            ),
+            span: Span {
+                line: 0,
+                column: 0,
+                start: 0,
+                end: 0,
+            },
+        }),
+    }
+}
+
+fn native_join(args: Vec<Value>) -> Result<Value, RuntimeError> {
+    if args.len() != 2 {
+        return Err(native_err_arg("join", 2, args.len()));
+    }
+    match (&args[0], &args[1]) {
+        (Value::List(items), Value::Str(delim)) => {
+            let mut str_items = Vec::new();
+            for item in items {
+                match item {
+                    Value::Str(s) => str_items.push(s.clone()),
+                    other => return Err(RuntimeError {
+                        message: format!(
+                            "'join' expects a list of strings as first argument, got list of '{}'",
+                            other.type_name()
+                        ),
+                        span: Span {
+                            line: 0,
+                            column: 0,
+                            start: 0,
+                            end: 0,
+                        },
+                    }),
+                }
+            }
+            Ok(Value::Str(str_items.join(delim)))
+        }
+        (a, b) => Err(RuntimeError {
+            message: format!(
+                "'join' expects a list and a string, got '{}' and '{}'",
+                a.type_name(),
+                b.type_name()
+            ),
+            span: Span {
+                line: 0,
+                column: 0,
+                start: 0,
+                end: 0,
+            },
+        }),
+    }
 }
 
 // ─── Integration tests ────────────────────────────────────────────────────────
@@ -1363,7 +2548,12 @@ mod integration_tests {
     }
 
     fn get(interp: &Interpreter, name: &str) -> Value {
-        let span = Span { line: 0, column: 0, start: 0, end: 0 };
+        let span = Span {
+            line: 0,
+            column: 0,
+            start: 0,
+            end: 0,
+        };
         interp.environment.get(name, span).unwrap()
     }
 
@@ -1382,7 +2572,9 @@ mod integration_tests {
             assert_eq!(items.len(), 3);
             assert!(matches!(items[0], Value::Int(1)));
             assert!(matches!(items[2], Value::Int(3)));
-        } else { panic!("expected list"); }
+        } else {
+            panic!("expected list");
+        }
     }
 
     #[test]
@@ -1422,7 +2614,9 @@ mod integration_tests {
         if let Value::List(items) = get(&i, "result") {
             assert_eq!(items.len(), 3);
             assert!(matches!(items[2], Value::Int(3)));
-        } else { panic!("expected list"); }
+        } else {
+            panic!("expected list");
+        }
     }
 
     #[test]
@@ -1430,7 +2624,9 @@ mod integration_tests {
         let i = run_ok("let result = pop([1, 2, 3]);");
         if let Value::List(items) = get(&i, "result") {
             assert_eq!(items.len(), 2);
-        } else { panic!("expected list"); }
+        } else {
+            panic!("expected list");
+        }
     }
 
     // ── Built-ins: toString, parseInt, toFloat ────────────────────────────────
@@ -1452,7 +2648,9 @@ mod integration_tests {
         let i = run_ok("let result = toFloat(\"3.14\");");
         if let Value::Float(f) = get(&i, "result") {
             assert!((f - 3.14).abs() < 1e-9);
-        } else { panic!("expected float"); }
+        } else {
+            panic!("expected float");
+        }
     }
 
     #[test]
