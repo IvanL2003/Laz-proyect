@@ -318,6 +318,15 @@ impl Parser {
                 self.expect(&TokenKind::Greater)?;
                 Ok(TypeAnnotation::List(Box::new(inner)))
             }
+            TokenKind::DictType => {
+                // Expect dict<KeyType, ValueType>
+                self.expect(&TokenKind::Less)?;
+                let key_type = self.parse_type()?;
+                self.expect(&TokenKind::Comma)?;
+                let value_type = self.parse_type()?;
+                self.expect(&TokenKind::Greater)?;
+                Ok(TypeAnnotation::Dict(Box::new(key_type), Box::new(value_type)))
+            }
             TokenKind::Ident(name) if name == "Result" => {
                 // Result<T, E>
                 self.expect(&TokenKind::Less)?;
@@ -444,21 +453,47 @@ impl Parser {
     }
 
     fn parse_for_stmt(&mut self) -> Result<Stmt, ParseError> {
+        // for i in 1..10 { }            → Stmt::For (range)
+        // for item in myList { }         → Stmt::ForEach (collection, 1 var)
+        // for k, v in myDict { }         → Stmt::ForEach (collection, 2 vars)
         let for_token = self.advance(); // consume 'for'
-        let (variable, _) = self.expect_ident()?;
-        self.expect(&TokenKind::In)?;
-        let start = self.parse_expression()?;
-        self.expect(&TokenKind::DotDot)?;
-        let end = self.parse_expression()?;
-        let body = self.parse_block()?;
 
-        Ok(Stmt::For {
-            variable,
-            start,
-            end,
-            body,
-            span: for_token.span,
-        })
+        // Parse one or two loop variables
+        let mut variables = Vec::new();
+        let (first_var, _) = self.expect_ident()?;
+        variables.push(first_var);
+        if self.match_token(&TokenKind::Comma) {
+            let (second_var, _) = self.expect_ident()?;
+            variables.push(second_var);
+        }
+
+        self.expect(&TokenKind::In)?;
+
+        // Parse the start / iterable expression.
+        // `..` is not a binary operator so parse_expression() stops before it.
+        let expr = self.parse_expression()?;
+
+        if self.match_token(&TokenKind::DotDot) {
+            // Range: for i in start..end { }
+            let end = self.parse_expression()?;
+            let body = self.parse_block()?;
+            Ok(Stmt::For {
+                variable: variables.remove(0),
+                start: expr,
+                end,
+                body,
+                span: for_token.span,
+            })
+        } else {
+            // Collection: for item in list { }  /  for k, v in dict { }
+            let body = self.parse_block()?;
+            Ok(Stmt::ForEach {
+                variable: variables,
+                iterable: Box::new(expr),
+                body,
+                span: for_token.span,
+            })
+        }
     }
 
     fn parse_return_stmt(&mut self) -> Result<Stmt, ParseError> {
@@ -1001,6 +1036,36 @@ impl Parser {
                     end: close.span.end,
                 };
                 Ok(Expr::ListLiteral { elements, span })
+            }
+
+            // { key: value, ... }  o  {}
+            TokenKind::LeftBrace => {
+                self.advance(); // consume '{'
+                let mut entries = Vec::new();
+                if !self.check(&TokenKind::RightBrace) {
+                    loop {
+                        let key = self.parse_expression()?;
+                        self.expect(&TokenKind::Colon)?;
+                        let value = self.parse_expression()?;
+                        entries.push((key, value));
+
+                        if !self.match_token(&TokenKind::Comma) {
+                            break;
+                        }
+                        // trailing comma antes de } es valido
+                        if self.check(&TokenKind::RightBrace) {
+                            break;
+                        }
+                    }
+                }
+                let close = self.expect(&TokenKind::RightBrace)?;
+                let span = Span {
+                    line: token.span.line,
+                    column: token.span.column,
+                    start: token.span.start,
+                    end: close.span.end,
+                };
+                Ok(Expr::DictLiteral { entries, span })
             }
 
             // Lambda con params: |x, y| expr   |x, y| { block }

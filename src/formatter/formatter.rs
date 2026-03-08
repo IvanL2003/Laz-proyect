@@ -258,6 +258,9 @@ impl Formatter {
             TypeAnnotation::StringType => "string".to_string(),
             TypeAnnotation::Void => "void".to_string(),
             TypeAnnotation::List(inner) => format!("list<{}>", self.format_type(inner)),
+            TypeAnnotation::Dict(key_type, value_type) => {
+                format!("dict<{}, {}>", self.format_type(key_type), self.format_type(value_type))
+            }
             TypeAnnotation::Result(ok_t, err_t) => {
                 format!("Result<{}, {}>", self.format_type(ok_t), self.format_type(err_t))
             }
@@ -449,6 +452,21 @@ impl Formatter {
                 self.emit_inline_comment(span.line);
             }
 
+            Stmt::ForEach { variable, iterable, body, span } => {
+                let vars = variable.join(", ");
+                self.output.push_str(&format!(
+                    "{}for {} in {} {{\n",
+                    self.indent(),
+                    vars,
+                    self.format_expr(iterable)
+                ));
+                self.indent_level += 1;
+                self.format_block_inner(body);
+                self.indent_level -= 1;
+                self.output.push_str(&format!("{}}}\n", self.indent()));
+                self.emit_inline_comment(span.line);
+            }
+
             Stmt::Match { subject, arms, span } => {
                 self.output.push_str(&format!(
                     "{}match {} {{\n",
@@ -487,7 +505,8 @@ impl Formatter {
             | Stmt::Return { span, .. }
             | Stmt::Print { span, .. }
             | Stmt::Expression { span, .. }
-            | Stmt::Match { span, .. } => *span,
+            | Stmt::Match { span, .. }
+            | Stmt::ForEach { span, .. } => *span,
         }
     }
 
@@ -628,6 +647,14 @@ impl Formatter {
                     .collect::<Vec<_>>()
                     .join(", ");
                 format!("[{}]", elems_str)
+            }
+            Expr::DictLiteral { entries, .. } => {
+                let entries_str = entries
+                    .iter()
+                    .map(|(k, v)| format!("{}: {}", self.format_expr(k), self.format_expr(v)))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("{{{}}}", entries_str)
             }
 
             Expr::Index { object, index, .. } => {

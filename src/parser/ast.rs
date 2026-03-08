@@ -105,6 +105,7 @@ pub enum TypeAnnotation {
     StringType,
     Void,
     List(Box<TypeAnnotation>),                                    // list<T>
+    Dict(Box<TypeAnnotation>, Box<TypeAnnotation>),              // dict<K, V>
     Result(Box<TypeAnnotation>, Box<TypeAnnotation>),             // Result<T, E>
     Option(Box<TypeAnnotation>),                                  // Option<T>
     UserDefined(String),                                          // nombre del struct
@@ -173,6 +174,12 @@ pub enum Stmt {
         variable: String,
         start: Expr,
         end: Expr,
+        body: Block,
+        span: Span,
+    },
+    ForEach {
+        variable: Vec<String>,
+        iterable: Box<Expr>,
         body: Block,
         span: Span,
     },
@@ -332,6 +339,11 @@ pub enum Expr {
         span: Span,
     },
 
+    DictLiteral {
+        entries: Vec<(Expr, Expr)>, // Vec de pares (clave, valor)
+        span: Span,
+    },
+
     // objeto[indice]
     // ej: arr[0],  users[i],  matrix[j]
     Index {
@@ -413,6 +425,7 @@ impl Expr {
             | Expr::StructInit { span, .. }
             | Expr::Grouped { span, .. }
             | Expr::ListLiteral { span, .. }
+            | Expr::DictLiteral { span, .. }
             | Expr::Index { span, .. }
             | Expr::Lambda { span, .. }
             | Expr::FString { span, .. }

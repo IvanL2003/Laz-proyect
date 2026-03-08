@@ -1,3 +1,4 @@
+use std::hash::Hash;
 use crate::lexer::Span;
 use crate::parser::ast::*;
 use crate::utils::csv::DataTable;
@@ -50,8 +51,51 @@ pub enum Value {
         enum_name: String,
         variant: String,
     },
+    // Dictionarios, sets, tuplas, etc pueden ser añadidos como nuevas variantes si se quieren soportar nativamente.
+    Dict(HashMap<HashableValue, Value>), // ejemplo de diccionario con claves y valores de cualquier tipo
+}
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum HashableValue {
+    Int(i64),
+    Bool(bool),
+    Str(String),
+    None,
+} 
+impl TryFrom<Value> for HashableValue {
+    type Error = &'static str;
+
+    fn try_from(value: Value) -> Result<Self, Self::Error> {
+        match value {
+            Value::Int(i) => Ok(HashableValue::Int(i)),
+            Value::Bool(b) => Ok(HashableValue::Bool(b)),
+            Value::Str(s) => Ok(HashableValue::Str(s)),
+            Value::None => Ok(HashableValue::None),
+            _ => Err("Value is not hashable"),
+        }
+    }
+}
+impl HashableValue {
+    pub fn to_display_string(&self) -> String {
+        match self {
+            HashableValue::Int(i) => i.to_string(),
+            HashableValue::Bool(b) => b.to_string(),
+            HashableValue::Str(s) => s.clone(),
+            HashableValue::None => "none".to_string(),
+        }
+    }
+
+    // Convierte de vuelta a Value (para iteracion, builtins, etc.)
+    pub fn into_value(self) -> Value {
+        match self {
+            HashableValue::Int(i) => Value::Int(i),
+            HashableValue::Bool(b) => Value::Bool(b),
+            HashableValue::Str(s) => Value::Str(s),
+            HashableValue::None => Value::None,
+        }
+    }
 }
 
+impl Eq for Value {}
 impl PartialEq for Value {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
@@ -79,6 +123,8 @@ impl PartialEq for Value {
                     fields: f2,
                 },
             ) => t1 == t2 && f1 == f2,
+            // Dicts: iguales si tienen las mismas claves y valores
+            (Value::Dict(a), Value::Dict(b)) => a == b,
             // Las funciones no tienen igualdad estructural
             (Value::Func { .. }, Value::Func { .. }) => false,
             // Enum variants: iguales si mismo enum y mismo variant
@@ -91,6 +137,9 @@ impl PartialEq for Value {
         }
     }
 }
+
+
+
 
 impl Value {
     // Devuelve el nombre del tipo como string (usado por typeOf y mensajes de error)
@@ -112,6 +161,7 @@ impl Value {
             Value::Void => "void",
             Value::Func { .. } => "fn",
             Value::EnumVariant { enum_name, .. } => enum_name,
+            Value::Dict(_) => "dict",
         }
     }
     #[allow(dead_code)]
@@ -127,6 +177,7 @@ impl Value {
             Value::StructInstance { .. } => true,
             Value::Func { .. } => true,
             Value::EnumVariant { .. } => true,
+            Value::Dict(m) => !m.is_empty(),
         }
     }
     #[allow(dead_code)]
@@ -194,6 +245,13 @@ impl Value {
             }
             Value::EnumVariant { enum_name, variant } => {
                 format!("{}::{}", enum_name, variant)
+            }
+            Value::Dict(map) => {
+                let mut entries: Vec<String> = map.iter()
+                    .map(|(k, v)| format!("{}: {}", k.to_display_string(), v.to_display_string()))
+                    .collect();
+                entries.sort(); // orden determinista para tests
+                format!("{{{}}}", entries.join(", "))
             }
         }
     }
@@ -400,6 +458,11 @@ impl Interpreter {
         native_functions.insert("concat".to_string(), native_concat);
         native_functions.insert("reverse".to_string(), native_reverse);
         native_functions.insert("slice".to_string(),native_slice);
+        native_functions.insert("keys".to_string(), native_keys);
+        native_functions.insert("values".to_string(), native_values);
+        native_functions.insert("get".to_string(), native_get);
+        native_functions.insert("containsKey".to_string(), native_contains_key);
+        native_functions.insert("remove".to_string(), native_remove);
         
 
         Interpreter {
@@ -767,6 +830,63 @@ impl Interpreter {
                 Ok(StmtResult::Normal)
             }
 
+            Stmt::ForEach { 
+                variable, 
+                iterable, 
+                body, 
+                span 
+            } => {
+                let iterable_val = self.evaluate_expr(iterable)?;
+
+                match iterable_val {
+                    Value::List(items) => {
+                        for item in items {
+                            self.environment.push_scope();
+                            self.environment.define(variable[0].clone(), item, false);
+                            let result = self.execute_block_inner(body);
+                            self.environment.pop_scope();
+                            match result? {
+                                StmtResult::Normal => {}
+                                ret @ StmtResult::Return(_) => return Ok(ret),
+                            }
+                        }
+                    }
+                    Value::Dict(d) => {
+                        for (k, v) in d {
+                            self.environment.push_scope();
+                            if variable.len() >= 2 {
+                                // for key, value in dict { }
+                                self.environment.define(variable[0].clone(), k.into_value(), false);
+                                self.environment.define(variable[1].clone(), v, false);
+                            } else {
+                                // for entry in dict { } → entry.key / entry.value
+                                let mut fields = HashMap::new();
+                                fields.insert("key".to_string(), k.into_value());
+                                fields.insert("value".to_string(), v);
+                                let entry = Value::StructInstance {
+                                    type_name: "Entry".to_string(),
+                                    fields,
+                                };
+                                self.environment.define(variable[0].clone(), entry, false);
+                            }
+                            let result = self.execute_block_inner(body);
+                            self.environment.pop_scope();
+                            match result? {
+                                StmtResult::Normal => {}
+                                ret @ StmtResult::Return(_) => return Ok(ret),
+                            }
+                        }
+                    }
+                    other => {
+                        return Err(RuntimeError {
+                            message: format!("'for in' expects a list or dict, got '{}'", other.type_name()),
+                            span: *span,
+                        });
+                    }
+                }
+                Ok(StmtResult::Normal)
+            
+            }
             // return 42;   value=Some(expr)   --> StmtResult::Return(Value)
             // return;      value=None          --> StmtResult::Return(Void)
             // StmtResult::Return burbujea hasta call_function, que lo extrae
@@ -909,8 +1029,27 @@ impl Interpreter {
                 Ok(Value::List(values))
             }
 
+            // { key: value, ... }  -->  evalua cada par y construye Value::Dict
+            // {"a": 1, "b": 2}  -->  Value::Dict(HashMap<HashableValue, Value>)
+            // Claves validas: string, int, bool, none
+            Expr::DictLiteral { entries, .. } => {
+                let mut map: HashMap<HashableValue, Value> = HashMap::new();
+                for (expr_key, expr_value) in entries {
+                    let key_val = self.evaluate_expr(expr_key)?;
+                    let value_val = self.evaluate_expr(expr_value)?;
+                    let hashable = HashableValue::try_from(key_val).map_err(|_| RuntimeError {
+                        message: "dict key must be string, int, bool or none".to_string(),
+                        span: expr_key.span(),
+                    })?;
+                    map.insert(hashable, value_val);
+                }
+                Ok(Value::Dict(map))
+            }
+
             // objeto[indice]  -->  accede al elemento indice de la lista
-            // indice debe ser int; error si fuera de rango
+            // objeto[indice]
+            //   list[int]          — acceso por posicion
+            //   dict[key]          — acceso por clave hashable
             Expr::Index {
                 object,
                 index,
@@ -918,17 +1057,15 @@ impl Interpreter {
             } => {
                 let obj_val = self.evaluate_expr(object)?;
                 let idx_val = self.evaluate_expr(index)?;
-                let idx = match idx_val {
-                    Value::Int(i) => i,
-                    _ => {
-                        return Err(RuntimeError {
-                            message: "list index must be an integer".to_string(),
-                            span: *span,
-                        })
-                    }
-                };
                 match obj_val {
                     Value::List(items) => {
+                        let idx = match idx_val {
+                            Value::Int(i) => i,
+                            other => return Err(RuntimeError {
+                                message: format!("list index must be an integer, got '{}'", other.type_name()),
+                                span: *span,
+                            }),
+                        };
                         let len = items.len() as i64;
                         if idx < 0 || idx >= len {
                             Err(RuntimeError {
@@ -937,6 +1074,19 @@ impl Interpreter {
                             })
                         } else {
                             Ok(items[idx as usize].clone())
+                        }
+                    }
+                    Value::Dict(map) => {
+                        let hk = HashableValue::try_from(idx_val).map_err(|_| RuntimeError {
+                            message: "dict key must be string, int, bool or none".to_string(),
+                            span: *span,
+                        })?;
+                        match map.get(&hk) {
+                            Some(v) => Ok(v.clone()),
+                            None => Err(RuntimeError {
+                                message: format!("key '{}' not found in dict", hk.to_display_string()),
+                                span: *span,
+                            }),
                         }
                     }
                     other => Err(RuntimeError {
@@ -1830,6 +1980,7 @@ impl Interpreter {
             }
             (Value::List(_), TypeAnnotation::List(_)) => true,
             (Value::List(_), TypeAnnotation::UserDefined(_)) => true, // Lists from SQL are loosely typed
+            (Value::Dict(_), TypeAnnotation::Dict(_, _)) => true,
             // Allow int -> float promotion in let bindings
             (Value::Int(_), TypeAnnotation::Float) => true,
             _ => false,
@@ -1857,6 +2008,11 @@ impl Interpreter {
             TypeAnnotation::StringType => "string".to_string(),
             TypeAnnotation::Void => "void".to_string(),
             TypeAnnotation::List(inner) => format!("list<{}>", Self::type_ann_name(inner)),
+            TypeAnnotation::Dict(keys, values) => format!(
+                "dict<{}, {}>",
+                Self::type_ann_name(keys),
+                Self::type_ann_name(values)
+            ),
             TypeAnnotation::Result(ok_t, err_t) => {
                 format!(
                     "Result<{}, {}>",
@@ -1897,10 +2053,11 @@ fn native_len(args: Vec<Value>) -> Result<Value, RuntimeError> {
     }
     match &args[0] {
         Value::List(items) => Ok(Value::Int(items.len() as i64)),
+        Value::Dict(map) => Ok(Value::Int(map.len() as i64)),
         Value::Str(s) => Ok(Value::Int(s.chars().count() as i64)),
         other => Err(RuntimeError {
             message: format!(
-                "'len' expects a list or string, got '{}'",
+                "'len' expects a list, dict or string, got '{}'",
                 other.type_name()
             ),
             span: Span {
@@ -1913,29 +2070,52 @@ fn native_len(args: Vec<Value>) -> Result<Value, RuntimeError> {
     }
 }
 
-fn native_push(mut args: Vec<Value>) -> Result<Value, RuntimeError> {
-    if args.len() != 2 {
-        return Err(native_err_arg("push", 2, args.len()));
-    }
-    let elem = args.pop().unwrap();
-    let list = args.pop().unwrap();
-    match list {
-        Value::List(mut items) => {
-            items.push(elem);
-            Ok(Value::List(items))
+fn native_push(args: Vec<Value>) -> Result<Value, RuntimeError> {
+    // push(list, elem)         — añade elem al final de la lista
+    // push(dict, key, value)   — inserta clave-valor en el dict
+    match args.len() {
+        2 => {
+            // push(list, elem)
+            match args.into_iter().collect::<Vec<_>>().as_mut_slice() {
+                [list, elem] => {
+                    let list = list.clone();
+                    let elem = elem.clone();
+                    match list {
+                        Value::List(mut items) => {
+                            items.push(elem);
+                            Ok(Value::List(items))
+                        }
+                        other => Err(RuntimeError {
+                            message: format!("'push' expects a list as first argument, got '{}'", other.type_name()),
+                            span: Span { line: 0, column: 0, start: 0, end: 0 },
+                        }),
+                    }
+                }
+                _ => unreachable!(),
+            }
         }
-        other => Err(RuntimeError {
-            message: format!(
-                "'push' expects a list as first argument, got '{}'",
-                other.type_name()
-            ),
-            span: Span {
-                line: 0,
-                column: 0,
-                start: 0,
-                end: 0,
-            },
-        }),
+        3 => {
+            // push(dict, key, value)
+            let mut it = args.into_iter();
+            let dict = it.next().unwrap();
+            let key  = it.next().unwrap();
+            let val  = it.next().unwrap();
+            match dict {
+                Value::Dict(mut map) => {
+                    let hk = HashableValue::try_from(key).map_err(|_| RuntimeError {
+                        message: "dict key must be string, int, bool or none".to_string(),
+                        span: Span { line: 0, column: 0, start: 0, end: 0 },
+                    })?;
+                    map.insert(hk, val);
+                    Ok(Value::Dict(map))
+                }
+                other => Err(RuntimeError {
+                    message: format!("'push(dict, key, val)' expects a dict, got '{}'", other.type_name()),
+                    span: Span { line: 0, column: 0, start: 0, end: 0 },
+                }),
+            }
+        }
+        n => Err(native_err_arg("push", 2, n)),
     }
 }
 
@@ -1971,6 +2151,7 @@ fn native_pop(args: Vec<Value>) -> Result<Value, RuntimeError> {
         }),
     }
 }
+
 
 fn native_to_string(args: Vec<Value>) -> Result<Value, RuntimeError> {
     if args.len() != 1 {
@@ -2999,6 +3180,106 @@ fn native_reverse(args: Vec<Value>) -> Result<Value, RuntimeError> {
         }),
     }
 }
+fn native_keys(args: Vec<Value>) -> Result<Value, RuntimeError> {
+    if args.len() != 1 {
+        return Err(native_err_arg("keys", 1, args.len()));
+    }
+    match &args[0] {
+        Value::Dict(d) => {
+            let mut keys: Vec<Value> = d.keys().cloned().map(|k| k.into_value()).collect();
+            keys.sort_by(|a, b| a.to_display_string().cmp(&b.to_display_string()));
+            Ok(Value::List(keys))
+        }
+        other => Err(RuntimeError {
+            message: format!("'keys' expects a dict, got '{}'", other.type_name()),
+            span: Span { line: 0, column: 0, start: 0, end: 0 },
+        }),
+    }
+}
+
+fn native_values(args: Vec<Value>) -> Result<Value, RuntimeError> {
+    if args.len() != 1 {
+        return Err(native_err_arg("values", 1, args.len()));
+    }
+    match &args[0] {
+        Value::Dict(d) => {
+            let values: Vec<Value> = d.values().cloned().collect();
+            Ok(Value::List(values))
+        }
+        other => Err(RuntimeError {
+            message: format!("'values' expects a dict, got '{}'", other.type_name()),
+            span: Span { line: 0, column: 0, start: 0, end: 0 },
+        }),
+    }
+}
+
+
+// get(dict, key) → some(value) si existe, none si no
+fn native_get(args: Vec<Value>) -> Result<Value, RuntimeError> {
+    if args.len() != 2 {
+        return Err(native_err_arg("get", 2, args.len()));
+    }
+    match &args[0] {
+        Value::Dict(d) => {
+            let hk = HashableValue::try_from(args[1].clone()).map_err(|_| RuntimeError {
+                message: "dict key must be string, int, bool or none".to_string(),
+                span: Span { line: 0, column: 0, start: 0, end: 0 },
+            })?;
+            match d.get(&hk) {
+                Some(v) => Ok(Value::Some(Box::new(v.clone()))),
+                None => Ok(Value::None),
+            }
+        }
+        other => Err(RuntimeError {
+            message: format!("'get' expects a dict, got '{}'", other.type_name()),
+            span: Span { line: 0, column: 0, start: 0, end: 0 },
+        }),
+    }
+}
+
+// containsKey(dict, key) → bool
+fn native_contains_key(args: Vec<Value>) -> Result<Value, RuntimeError> {
+    if args.len() != 2 {
+        return Err(native_err_arg("containsKey", 2, args.len()));
+    }
+    match &args[0] {
+        Value::Dict(d) => {
+            let hk = HashableValue::try_from(args[1].clone()).map_err(|_| RuntimeError {
+                message: "dict key must be string, int, bool or none".to_string(),
+                span: Span { line: 0, column: 0, start: 0, end: 0 },
+            })?;
+            Ok(Value::Bool(d.contains_key(&hk)))
+        }
+        other => Err(RuntimeError {
+            message: format!("'containsKey' expects a dict, got '{}'", other.type_name()),
+            span: Span { line: 0, column: 0, start: 0, end: 0 },
+        }),
+    }
+}
+
+// remove(dict, key) → nuevo dict sin esa clave
+fn native_remove(args: Vec<Value>) -> Result<Value, RuntimeError> {
+    if args.len() != 2 {
+        return Err(native_err_arg("remove", 2, args.len()));
+    }
+    let mut it = args.into_iter();
+    let dict = it.next().unwrap();
+    let key  = it.next().unwrap();
+    match dict {
+        Value::Dict(mut d) => {
+            let hk = HashableValue::try_from(key).map_err(|_| RuntimeError {
+                message: "dict key must be string, int, bool or none".to_string(),
+                span: Span { line: 0, column: 0, start: 0, end: 0 },
+            })?;
+            d.remove(&hk);
+            Ok(Value::Dict(d))
+        }
+        other => Err(RuntimeError {
+            message: format!("'remove' expects a dict, got '{}'", other.type_name()),
+            span: Span { line: 0, column: 0, start: 0, end: 0 },
+        }),
+    }
+}
 
 fn native_slice(args: Vec<Value>) -> Result<Value, RuntimeError> {
     if args.len() != 3 {
@@ -3780,6 +4061,147 @@ let result = f"doble de 5 es {double(5)}";
 "#;
         let i = run_ok(src);
         assert!(matches!(get(&i, "result"), Value::Str(ref s) if s == "doble de 5 es 10"));
+    }
+
+    // ── Diccionarios ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_dict_empty() {
+        let i = run_ok("let d: dict<string, int> = {};");
+        assert!(matches!(get(&i, "d"), Value::Dict(ref m) if m.is_empty()));
+    }
+
+    #[test]
+    fn test_dict_literal_string_keys() {
+        let i = run_ok(r#"let d = {"a": 1, "b": 2};"#);
+        if let Value::Dict(m) = get(&i, "d") {
+            assert_eq!(m.len(), 2);
+            assert_eq!(m.get(&HashableValue::Str("a".to_string())), Some(&Value::Int(1)));
+            assert_eq!(m.get(&HashableValue::Str("b".to_string())), Some(&Value::Int(2)));
+        } else { panic!("expected dict"); }
+    }
+
+    #[test]
+    fn test_dict_literal_int_keys() {
+        let i = run_ok(r#"let d = {1: "one", 2: "two"};"#);
+        if let Value::Dict(m) = get(&i, "d") {
+            assert_eq!(m.len(), 2);
+            assert_eq!(m.get(&HashableValue::Int(1)), Some(&Value::Str("one".to_string())));
+        } else { panic!("expected dict"); }
+    }
+
+    #[test]
+    fn test_dict_index_read() {
+        let i = run_ok(r#"let d = {"x": 42}; let result = d["x"];"#);
+        assert!(matches!(get(&i, "result"), Value::Int(42)));
+    }
+
+    #[test]
+    fn test_dict_index_missing_key_errors() {
+        run_err(r#"let d = {"a": 1}; let x = d["b"];"#);
+    }
+
+    #[test]
+    fn test_dict_push_insert() {
+        // push(dict, key, value) → nuevo dict con la clave añadida
+        let i = run_ok(r#"let d = {"a": 1}; let d2 = push(d, "b", 2); let result = d2["b"];"#);
+        assert!(matches!(get(&i, "result"), Value::Int(2)));
+    }
+
+    #[test]
+    fn test_dict_len() {
+        let i = run_ok(r#"let d = {"a": 1, "b": 2, "c": 3}; let result = len(d);"#);
+        assert!(matches!(get(&i, "result"), Value::Int(3)));
+    }
+
+    #[test]
+    fn test_dict_keys() {
+        let i = run_ok(r#"let d = {"b": 2, "a": 1}; let result = len(keys(d));"#);
+        assert!(matches!(get(&i, "result"), Value::Int(2)));
+    }
+
+    #[test]
+    fn test_dict_values() {
+        let i = run_ok(r#"let d = {"a": 10, "b": 20}; let result = len(values(d));"#);
+        assert!(matches!(get(&i, "result"), Value::Int(2)));
+    }
+
+    #[test]
+    fn test_dict_get_found() {
+        // get(dict, key) → some(value) si existe
+        let i = run_ok(r#"let d = {"hello": 99}; let result = get(d, "hello");"#);
+        assert!(matches!(get(&i, "result"), Value::Some(_)));
+        if let Value::Some(inner) = get(&i, "result") {
+            assert!(matches!(*inner, Value::Int(99)));
+        }
+    }
+
+    #[test]
+    fn test_dict_get_not_found() {
+        // get(dict, key) → none si no existe
+        let i = run_ok(r#"let d = {"a": 1}; let result = get(d, "z");"#);
+        assert!(matches!(get(&i, "result"), Value::None));
+    }
+
+    #[test]
+    fn test_dict_contains_key_true() {
+        let i = run_ok(r#"let d = {"k": 5}; let result = containsKey(d, "k");"#);
+        assert!(matches!(get(&i, "result"), Value::Bool(true)));
+    }
+
+    #[test]
+    fn test_dict_contains_key_false() {
+        let i = run_ok(r#"let d = {"k": 5}; let result = containsKey(d, "x");"#);
+        assert!(matches!(get(&i, "result"), Value::Bool(false)));
+    }
+
+    #[test]
+    fn test_dict_remove() {
+        let i = run_ok(r#"let d = {"a": 1, "b": 2}; let d2 = remove(d, "a"); let result = len(d2);"#);
+        assert!(matches!(get(&i, "result"), Value::Int(1)));
+    }
+
+    #[test]
+    fn test_foreach_list() {
+        let src = r#"
+let mut sum = 0;
+let items = [10, 20, 30];
+for item in items {
+    sum = sum + item;
+}
+let result = sum;
+"#;
+        let i = run_ok(src);
+        assert!(matches!(get(&i, "result"), Value::Int(60)));
+    }
+
+    #[test]
+    fn test_foreach_dict_single_var() {
+        // for entry in dict { } → entry.key, entry.value
+        let src = r#"
+let d = {"x": 1};
+let mut found = 0;
+for entry in d {
+    found = entry.value;
+}
+let result = found;
+"#;
+        let i = run_ok(src);
+        assert!(matches!(get(&i, "result"), Value::Int(1)));
+    }
+
+    #[test]
+    fn test_foreach_dict_two_vars() {
+        // for k, v in dict { }
+        let src = r#"
+let d = {"n": 42};
+let mut result = 0;
+for k, v in d {
+    result = v;
+}
+"#;
+        let i = run_ok(src);
+        assert!(matches!(get(&i, "result"), Value::Int(42)));
     }
 
     // ── User-defined Enums ────────────────────────────────────────────────────

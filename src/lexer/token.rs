@@ -59,6 +59,7 @@ pub enum TokenKind {
     StringType,
     VoidType,
     ListType,
+    DictType, 
 
     // Arithmetic
     Plus,
@@ -166,6 +167,7 @@ impl std::fmt::Display for TokenKind {
             TokenKind::StringType => write!(f, "string"),
             TokenKind::VoidType => write!(f, "void"),
             TokenKind::ListType => write!(f, "list"),
+            TokenKind::DictType => write!(f, "dict"),
             TokenKind::Plus => write!(f, "+"),
             TokenKind::Minus => write!(f, "-"),
             TokenKind::Star => write!(f, "*"),
@@ -248,6 +250,7 @@ pub fn lookup_keyword(ident: &str) -> Option<TokenKind> {
         "string" => Some(TokenKind::StringType),
         "void" => Some(TokenKind::VoidType),
         "list" => Some(TokenKind::ListType),
+        "dict" => Some(TokenKind::DictType),
         "SELECT" => Some(TokenKind::Select),
         "SINGLE" => Some(TokenKind::Single),
         "FROM" => Some(TokenKind::From),

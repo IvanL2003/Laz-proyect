@@ -139,6 +139,10 @@ impl TypeChecker {
                 self.validate_expr(end);
                 self.validate_block(body, in_function);
             }
+            Stmt::ForEach { iterable, body, .. } => {
+                self.validate_expr(iterable);
+                self.validate_block(body, in_function);
+            }
             Stmt::Return { value, span } => {
                 if !in_function {
                     self.errors.push(SemanticError {
@@ -183,8 +187,8 @@ impl TypeChecker {
                 const BUILTINS: &[(&str, usize)] = &[
                     // Tipo
                     ("typeOf", 1),
-                    // Listas
-                    ("len", 1), ("push", 2), ("pop", 1),
+                    // Listas / Colecciones
+                    ("len", 1), ("pop", 1),
                     ("sort", 1), ("first", 1), ("last", 1),
                     ("concat", 2), ("zip", 2), ("unzip", 1),
                     ("reverse", 1), ("slice", 3), ("contains", 2),
@@ -204,8 +208,22 @@ impl TypeChecker {
                     // Result / Option
                     ("ok", 1), ("err", 1), ("some", 1), ("none", 0),
                     ("unwrap", 1), ("is_ok", 1), ("is_err", 1), ("is_some", 1), ("is_none", 1),
+                    // Dict
+                    ("keys", 1), ("values", 1), ("get", 2), ("containsKey", 2), ("remove", 2),
+                    // push tiene aridad variable (2 o 3), se valida en runtime
                 ];
                 let builtin = BUILTINS.iter().find(|(name, _)| *name == callee.as_str());
+                // push es especial: 2 args (lista) o 3 args (dict)
+                if callee == "push" {
+                    if args.len() != 2 && args.len() != 3 {
+                        self.errors.push(SemanticError {
+                            message: format!("built-in 'push' expects 2 or 3 arguments, got {}", args.len()),
+                            span: *span,
+                        });
+                    }
+                    for arg in args { self.validate_expr(arg); }
+                    return;
+                }
 
                 if let Some(&expected_args) = self.functions.get(callee.as_str()) {
                     if args.len() != expected_args {
@@ -325,6 +343,12 @@ impl TypeChecker {
                     });
                 }
             }
+            Expr::DictLiteral { entries, .. } => {
+                for (k, v) in entries {
+                    self.validate_expr(k);
+                    self.validate_expr(v);
+                }
+            }
             // Literals and identifiers - nothing to validate at this stage
             _ => {}
         }
@@ -340,6 +364,10 @@ impl TypeChecker {
             }
             TypeAnnotation::List(inner) => {
                 self.validate_type(inner);
+            }
+            TypeAnnotation::Dict(key_type, value_type) => {
+                self.validate_type(key_type);
+                self.validate_type(value_type);
             }
             TypeAnnotation::Result(ok_t, err_t) => {
                 self.validate_type(ok_t);

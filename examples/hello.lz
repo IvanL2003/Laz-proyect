@@ -71,6 +71,13 @@ fn main() -> void {
     let sel: User = #SELECT SINGLE * FROM users WHERE is_awesome;
     print(sel);
     let fact5 = factorial(5);
+    let diccionario = {"one": 1, "two": 2, "three": 3};
+    for k in keys(diccionario) {
+        print("Key:", k);
+    } 
+    for v in values(diccionario) {
+        print("Value:", v);
+    }
 
     // typeOf demo
     print(f"typeOf(x): {typeOf(x)}");
